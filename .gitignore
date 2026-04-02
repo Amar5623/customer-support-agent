@@ -1,0 +1,40 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Node / Frontend
+node_modules/
+dist/
+.parcel-cache/
+.vite/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fixtures — don't commit real customer data
+tests/fixtures/*.png
+tests/fixtures/real_*.json
+
+tests/

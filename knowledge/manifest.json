@@ -1,0 +1,99 @@
+{
+  "_comment": "Leafy Knowledge Manifest — controls what FilePolicyStore loads and when.",
+
+  "version": "1.0",
+  "locale": "en",
+
+  "always_load": [
+    {
+      "file": "brand/voice.md",
+      "description": "Agent tone and communication rules — must be in every prompt",
+      "max_tokens": 400
+    },
+    {
+      "file": "brand/escalation.md",
+      "description": "When and how to escalate — always available to the agent",
+      "max_tokens": 300
+    },
+    {
+      "file": "00_company_identity.md",
+      "description": "Core company facts, brand voice, key reference table",
+      "max_tokens": 600
+    }
+  ],
+
+  "on_topic": [
+    {
+      "file": "policies/01_return_refund_policy.md",
+      "keywords": ["return", "refund", "exchange", "defective", "damaged", "wrong item",
+                   "rma", "send back", "broken", "not as described", "store credit"],
+      "priority": 1,
+      "max_tokens": 1200
+    },
+    {
+      "file": "policies/06_cancellation_policy.md",
+      "keywords": ["cancel", "cancellation", "stop order", "undo order", "change order"],
+      "priority": 2,
+      "max_tokens": 600
+    },
+    {
+      "file": "policies/02_shipping_delivery_policy.md",
+      "keywords": ["shipping", "delivery", "tracking", "lost", "package", "arrived",
+                   "delayed", "transit", "dispatch", "carrier", "customs", "international"],
+      "priority": 3,
+      "max_tokens": 900
+    },
+    {
+      "file": "policies/03_loyalty_program_rules.md",
+      "keywords": ["points", "loyalty", "rewards", "tier", "bronze", "silver", "gold",
+                   "platinum", "redeem", "earn", "expire", "leafy rewards"],
+      "priority": 4,
+      "max_tokens": 800
+    },
+    {
+      "file": "policies/04_payment_pricing_policy.md",
+      "keywords": ["payment", "pay", "card", "invoice", "receipt", "charge", "billing",
+                   "price", "discount", "promo", "code", "tax", "vat", "failed payment"],
+      "priority": 5,
+      "max_tokens": 700
+    },
+    {
+      "file": "policies/05_account_privacy_policy.md",
+      "keywords": ["account", "suspended", "banned", "password", "security", "privacy",
+                   "data", "delete account", "appeal", "2fa", "login", "access"],
+      "priority": 6,
+      "max_tokens": 700
+    },
+    {
+      "file": "faqs/orders.md",
+      "keywords": ["where is my order", "order status", "change address", "wrong address",
+                   "order not arrived", "order update", "when will", "how long"],
+      "priority": 7,
+      "max_tokens": 500
+    },
+    {
+      "file": "faqs/returns.md",
+      "keywords": ["how long refund", "refund status", "never got rma", "return label",
+                   "return not processed", "where is my refund"],
+      "priority": 8,
+      "max_tokens": 500
+    },
+    {
+      "file": "faqs/account.md",
+      "keywords": ["forgot password", "reset password", "delete account", "change email",
+                   "unsubscribe", "update details", "verify email"],
+      "priority": 9,
+      "max_tokens": 400
+    }
+  ],
+
+  "load_strategy": "always_load + top_3_on_topic",
+
+  "_note_on_load_strategy": "FilePolicyStore always loads the always_load block, then scores each on_topic file against the user message keywords and loads the top 3 matches. This keeps total context under ~4000 tokens for Phase 1 (stuffing). In Phase 3, swap POLICY_STORE=rag and this manifest becomes the RAG metadata config.",
+
+  "global_max_tokens": 4000,
+  "fallback_if_no_topic_match": [
+    "faqs/orders.md",
+    "faqs/returns.md"
+  ]
+}
