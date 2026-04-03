@@ -2,7 +2,6 @@
   "_comment": "Leafy Knowledge Manifest — controls what FilePolicyStore loads and when.",
 
   "version": "1.0",
-  "locale": "en",
 
   "always_load": [
     {

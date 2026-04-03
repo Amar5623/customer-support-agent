@@ -33,14 +33,14 @@ class Settings(BaseSettings):
 
     # ── Groq ───────────────────────────────────────────────────────────────
     groq_api_key: str = Field(..., description="Groq API key — required")
-    groq_model: str = Field(default="llama3-70b-8192")
+    groq_model: str = Field(default="llama-3.3-70b-versatile")
     groq_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     groq_max_tokens: int = Field(default=1024, gt=0)
     groq_timeout_seconds: int = Field(default=30, gt=0)
 
     # ── MongoDB ────────────────────────────────────────────────────────────
     mongo_uri: str = Field(..., description="MongoDB connection URI — required")
-    mongo_db_name: str = Field(default="leafy_support")
+    mongo_db_name: str = Field(default="leafy_popup_store")
     mongo_orders_collection: str = Field(default="orders")
     mongo_customers_collection: str = Field(default="customers")
     mongo_tickets_collection: str = Field(default="tickets")
@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # ── Knowledge base ─────────────────────────────────────────────────────
     knowledge_manifest_path: str = Field(default="knowledge/manifest.json")
     knowledge_base_dir: str = Field(default="knowledge/")
+
+    # Add inside Settings class in backend/core/config.py
+    jwt_secret_key: str = Field(
+        default="change-this-in-production-use-openssl-rand-hex-32",
+        description="Secret key for JWT signing"
+    )
 
     # ── Validators ─────────────────────────────────────────────────────────
     @field_validator("groq_api_key")
