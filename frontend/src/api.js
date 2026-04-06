@@ -58,8 +58,10 @@ export async function getNewSession() {
 }
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
+// order_id is intentionally removed — the agent handles order disambiguation
+// through conversation. No need for the frontend to manage order context.
 
-export async function sendMessage({ message, sessionId, orderId }) {
+export async function sendMessage({ message, sessionId }) {
   return handleResponse(
     await fetch(`${BASE_URL}/chat`, {
       method:  "POST",
@@ -67,7 +69,6 @@ export async function sendMessage({ message, sessionId, orderId }) {
       body:    JSON.stringify({
         message,
         session_id: sessionId,
-        order_id:   orderId || null,
       }),
     })
   );

@@ -49,9 +49,11 @@ class GetOrderDetails(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve full details of a specific order by its order ID. "
-            "Returns order status, products, shipping address, estimated dates, "
-            "and status history. Use when the customer asks about a specific order."
+            "Retrieve FULL details of a SPECIFIC order by its order_id. "
+            "Returns order status, products, shipping address, estimated dates, and status history. "
+            "IMPORTANT: Only call this tool AFTER the customer has confirmed which order they mean. "
+            "If the customer has not specified an order, call get_order_history first to list their "
+            "orders, then ask them to pick one. Never call this with a guessed or assumed order_id."
         )
 
     @property
@@ -61,7 +63,11 @@ class GetOrderDetails(BaseTool):
             "properties": {
                 "order_id": {
                     "type": "string",
-                    "description": "The MongoDB order ID (e.g. 682b73a0463e7f2b09ed2b1a)"
+                    "description": (
+                        "The MongoDB order ID confirmed by the customer "
+                        "(e.g. 682b73a0463e7f2b09ed2b1a). "
+                        "Must come from get_order_history results — never guessed."
+                    )
                 }
             },
             "required": ["order_id"]
@@ -148,7 +154,6 @@ class GetUserProfile(BaseTool):
         try:
             user = await self._db.users.find_one(
                 {"email": {"$regex": f"^{email}$", "$options": "i"}},
-                # Never expose sensitive internals
                 {"lastRecommendations": 0, "vai_text_embedding": 0}
             )
             if not user:
@@ -174,9 +179,15 @@ class GetOrderHistory(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve all orders for a customer using their email address. "
-            "Returns a summary list of orders with status and total amount. "
-            "Use when the customer asks 'what are my orders' or 'my order history'."
+            "Retrieve all recent orders for a customer by email. "
+            "Returns a summary list with order_id, status, item names, and dates. "
+            "ALWAYS call this tool FIRST whenever a customer asks about 'my order', "
+            "'where is my package', 'my delivery', or any order-related question "
+            "where they have not specified a particular order. "
+            "After getting results: if there is only 1 order, proceed with it. "
+            "If there are multiple orders, show the customer a plain-language list "
+            "and ask which one they mean — then call get_order_details on the chosen one. "
+            "Active orders (Processing, Shipped, In Transit) should be surfaced first."
         )
 
     @property
@@ -216,12 +227,20 @@ class GetOrderHistory(BaseTool):
                 }
             ).sort("createdAt", -1).limit(10)
 
-            orders = []
+            # Separate active vs completed orders so agent can surface active first
+            active_statuses = {"Processing", "In process", "Shipped", "In Transit",
+                               "Out for Delivery", "Ready for delivery", "Delayed"}
+
+            active_orders = []
+            other_orders = []
+
             async for order in cursor:
                 products = order.get("products", [])
-                orders.append({
+                status = order.get("status", "Unknown")
+                entry = {
                     "order_id": str(order["_id"]),
-                    "status": order.get("status"),
+                    "status": status,
+                    "is_active": status in active_statuses,
                     "created_at": (
                         order["createdAt"].isoformat()
                         if isinstance(order.get("createdAt"), datetime)
@@ -233,16 +252,29 @@ class GetOrderHistory(BaseTool):
                         else None
                     ),
                     "item_count": len(products),
-                    "items": [p.get("name", "Unknown") for p in products[:3]]
-                })
+                    "items": [p.get("name", "Unknown") for p in products[:3]],
+                }
+                if status in active_statuses:
+                    active_orders.append(entry)
+                else:
+                    other_orders.append(entry)
+
+            # Return active orders first, then the rest
+            orders = active_orders + other_orders
 
             if not orders:
                 return self.success({
                     "orders": [],
+                    "total": 0,
+                    "active_count": 0,
                     "message": "No orders found for this account."
                 })
 
-            return self.success({"orders": orders, "total": len(orders)})
+            return self.success({
+                "orders": orders,
+                "total": len(orders),
+                "active_count": len(active_orders),
+            })
 
         except Exception as e:
             logger.exception(f"get_order_history failed for {email}")
@@ -264,7 +296,8 @@ class GetReturnStatus(BaseTool):
         return (
             "Retrieve the return/refund status for a specific order. "
             "Returns return status, items being returned, refund amount, and timeline. "
-            "Use when the customer asks about a return or refund."
+            "Use when the customer asks about a return or refund. "
+            "If they haven't specified which order, call get_order_history first."
         )
 
     @property
@@ -285,8 +318,6 @@ class GetReturnStatus(BaseTool):
         if not order_id:
             return self.error("order_id is required.")
 
-        # FIX: orderId is stored as ObjectId in the returns collection, not a string.
-        # Passing a raw string to find_one() would never match — convert first.
         try:
             oid = ObjectId(order_id)
         except Exception:
@@ -306,7 +337,6 @@ class GetReturnStatus(BaseTool):
 
 # ── 5. Change Delivery Date ─────────────────────────────────────────────────────
 
-
 class ChangeDeliveryDate(BaseTool):
     def __init__(self, db: AsyncIOMotorDatabase):
         self._db = db
@@ -319,8 +349,10 @@ class ChangeDeliveryDate(BaseTool):
     def description(self) -> str:
         return (
             "Request a change to the estimated delivery date of an order. "
-            "Automatically approves or rejects based on warehouse schedule. "
-            "Use when the customer asks to change, reschedule, or delay their delivery."
+            "Automatically approves or creates a pending request based on warehouse schedule. "
+            "Use when the customer asks to change, reschedule, or delay their delivery. "
+            "If the customer hasn't specified which order, call get_order_history first "
+            "and confirm the order before calling this tool."
         )
 
     @property
@@ -330,7 +362,7 @@ class ChangeDeliveryDate(BaseTool):
             "properties": {
                 "order_id": {
                     "type": "string",
-                    "description": "The order ID to change delivery date for"
+                    "description": "The order ID confirmed by the customer"
                 },
                 "requested_date": {
                     "type": "string",
@@ -399,7 +431,7 @@ class ChangeDeliveryDate(BaseTool):
             if isinstance(warehouse_dt, datetime) and warehouse_dt.tzinfo is None:
                 warehouse_dt = warehouse_dt.replace(tzinfo=timezone.utc)
 
-            # 3. Feasibility check first
+            # 3. Feasibility check
             if req_dt < warehouse_dt:
                 return self.success({
                     "outcome": "rejected",
@@ -484,6 +516,7 @@ class ChangeDeliveryDate(BaseTool):
             logger.exception(f"change_delivery_date failed for {order_id}")
             return self.error(f"Failed to process date change request: {str(e)}")
 
+
 # ── 6. Change Delivery Address ──────────────────────────────────────────────────
 
 class ChangeDeliveryAddress(BaseTool):
@@ -499,7 +532,8 @@ class ChangeDeliveryAddress(BaseTool):
         return (
             "Change the delivery address on an order. "
             "Only possible if the order has not yet been shipped. "
-            "Use when the customer wants to update where their order is delivered."
+            "Use when the customer wants to update where their order is delivered. "
+            "If the customer hasn't specified which order, call get_order_history first."
         )
 
     @property
@@ -509,7 +543,7 @@ class ChangeDeliveryAddress(BaseTool):
             "properties": {
                 "order_id": {
                     "type": "string",
-                    "description": "The order ID to update the address for"
+                    "description": "The order ID confirmed by the customer"
                 },
                 "street_and_number": {
                     "type": "string",
@@ -592,17 +626,9 @@ class ChangeDeliveryAddress(BaseTool):
             return self.error(f"Failed to update address: {str(e)}")
 
 
-# ── Registry — all tools in one place ──────────────────────────────────────────
+# ── Registry ────────────────────────────────────────────────────────────────────
 
 def get_all_tools(db: AsyncIOMotorDatabase) -> list[BaseTool]:
-    """
-    Returns all registered tools.
-    Import this in container.py — don't instantiate tools individually.
-
-    Usage:
-        from backend.tools.mongo_tools import get_all_tools
-        tools = get_all_tools(db)
-    """
     return [
         GetOrderDetails(db),
         GetUserProfile(db),

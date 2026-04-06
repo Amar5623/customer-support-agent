@@ -12,9 +12,7 @@ const SUGGESTIONS = [
 ];
 
 export function ChatWindow({ user, messages, loading, onSend, sessionId }) {
-  const [input,  setInput]  = useState("");
-  const [orderId, setOrderId] = useState("");
-  const [showOrderInput, setShowOrderInput] = useState(false);
+  const [input, setInput] = useState("");
   const bottomRef = useRef(null);
   const inputRef  = useRef(null);
 
@@ -30,7 +28,7 @@ export function ChatWindow({ user, messages, loading, onSend, sessionId }) {
     const text = input.trim();
     if (!text || loading) return;
     setInput("");
-    onSend(text, orderId.trim() || null);
+    onSend(text);
   };
 
   const handleKey = (e) => {
@@ -41,7 +39,7 @@ export function ChatWindow({ user, messages, loading, onSend, sessionId }) {
   };
 
   const handleSuggestion = (s) => {
-    onSend(s, null);
+    onSend(s);
   };
 
   return (
@@ -60,44 +58,7 @@ export function ChatWindow({ user, messages, loading, onSend, sessionId }) {
             <p className="chat-header__status">Online · responds instantly</p>
           </div>
         </div>
-
-        <div className="chat-header__actions">
-          <button
-            className={`icon-btn ${showOrderInput ? "icon-btn--active" : ""}`}
-            onClick={() => setShowOrderInput(v => !v)}
-            title="Set order ID context"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-              <circle cx="12" cy="10" r="3"/>
-            </svg>
-          </button>
-        </div>
       </div>
-
-      {/* Order ID context bar */}
-      {showOrderInput && (
-        <div className="order-bar">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/>
-            <circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/>
-          </svg>
-          <input
-            className="order-bar__input"
-            type="text"
-            placeholder="Paste order ID to set context..."
-            value={orderId}
-            onChange={e => setOrderId(e.target.value)}
-          />
-          {orderId && (
-            <button className="order-bar__clear" onClick={() => setOrderId("")}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-              </svg>
-            </button>
-          )}
-        </div>
-      )}
 
       {/* Messages */}
       <div className="chat-messages">
@@ -128,14 +89,6 @@ export function ChatWindow({ user, messages, loading, onSend, sessionId }) {
 
       {/* Input */}
       <div className="chat-input-area">
-        {orderId && (
-          <div className="input-context-tag">
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <rect x="1" y="3" width="15" height="13"/>
-            </svg>
-            {orderId.slice(-8)}
-          </div>
-        )}
         <div className="input-row">
           <textarea
             ref={inputRef}

@@ -7,7 +7,7 @@ export function useChat(user) {
   const [messages,       setMessages]       = useState([]);
   const [loading,        setLoading]        = useState(false);
   const [sessionId,      setSessionId]      = useState(null);
-  const [conversations,  setConversations]  = useState([]);  // past sessions
+  const [conversations,  setConversations]  = useState([]);
   const [historyLoaded,  setHistoryLoaded]  = useState(false);
   const wsRef      = useRef(null);
   const sessionRef = useRef(null);
@@ -74,7 +74,8 @@ export function useChat(user) {
   }, [openWebSocket]);
 
   // ── Send message ───────────────────────────────────────────────────────────
-  const send = useCallback(async (text, orderId = null) => {
+  // No orderId parameter — the agent handles order disambiguation internally.
+  const send = useCallback(async (text) => {
     if (!text.trim() || loading) return;
 
     const userMsg = {
@@ -88,7 +89,7 @@ export function useChat(user) {
 
     try {
       const sid = await ensureSession();
-      const response = await sendMessage({ message: text, sessionId: sid, orderId });
+      const response = await sendMessage({ message: text, sessionId: sid });
 
       setMessages(prev => [...prev, {
         id:           `a-${Date.now()}`,
@@ -111,11 +112,9 @@ export function useChat(user) {
 
   // ── Load a past conversation into the current view ─────────────────────────
   const loadConversation = useCallback((conv) => {
-    // Close existing WS
     wsRef.current?.close();
     wsRef.current = null;
 
-    // Restore messages from history
     const restored = conv.messages.map((m, i) => ({
       id:        `hist-${i}`,
       role:      m.role,
@@ -124,7 +123,6 @@ export function useChat(user) {
     }));
     setMessages(restored);
 
-    // Reuse the session so the WS can still receive admin notifications
     sessionRef.current = conv.session_id;
     setSessionId(conv.session_id);
     openWebSocket(conv.session_id);

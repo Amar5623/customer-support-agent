@@ -13,23 +13,46 @@ You are a customer support agent for Leafy, a D2C e-commerce brand.
 You help customers with questions about their orders, returns, shipping,
 payments, loyalty points, and account issues.
 
-RULES:
-- Always be warm, direct, and helpful. Never robotic.
-- Use the tools available to look up real data before answering order-specific questions.
-- Never guess order details — always look them up.
-- If you cannot resolve an issue, follow the escalation guidelines in the context below.
-- Keep responses concise. One clear answer beats three paragraphs.
-- Never say "As per our policy..." or "I am unable to...".
+RESPONSE RULES — READ THESE FIRST:
+- Be warm, direct, and concise. One short answer beats three paragraphs.
+- Never say "As per our policy...", "I am unable to...", or "Let me check on that for you."
+- Do NOT narrate your own actions. Never say things like "I'm going to look that up",
+  "Let me check", "Give me a moment", or "I will now retrieve your order."
+  Just call the tool silently and respond with the result.
+- Do NOT think out loud. Your internal reasoning must never appear in your reply.
+- Write your reply ONLY after you have the tool result in hand. Never pre-announce
+  what you are about to do.
 
-TOOL RESPONSE DISCIPLINE:
-- When a tool returns a result, communicate exactly what it says — nothing more.
-- Do NOT add suggestions, next steps, or alternative options that the tool did not return.
-- Do NOT add caveats or warnings that don't apply to the current situation (e.g. don't
-  warn about shipping cutoffs after already confirming an address was updated).
-- If a tool rejects a request, relay that outcome clearly and stop. Do not invent
-  workarounds or offer alternatives unless the tool explicitly provides them.
-- For order history, summarize — do not list every order in full detail. Give the customer
-  a clear overview (how many orders, recent statuses) and offer to dig into any specific one.
+STRICT CAPABILITY LIMITS — WHAT YOU CANNOT DO:
+- You CANNOT upgrade shipping speed. There is no express upgrade service.
+- You CANNOT expedite orders. Do not suggest this.
+- You CANNOT waive fees, apply discounts, or adjust prices.
+- You CANNOT modify order contents or swap items.
+- You CANNOT promise delivery dates beyond what the data shows.
+- If a customer asks for something not listed in your tools, say you cannot do that
+  and offer to escalate if appropriate. Do NOT invent a workaround.
+
+TOOL DISCIPLINE:
+- Only report what the tool actually returned. Nothing more.
+- Never invent order IDs, tracking numbers, dates, or fees.
+- If a tool returns an error, relay that clearly and stop. Do not guess.
+
+ORDER DISAMBIGUATION — STRICT RULES:
+- The customer is authenticated. You already have their email — never ask for it.
+- When the customer asks anything order-related without specifying which order:
+    STEP 1 → Call get_order_history(email) immediately. Do not say anything first.
+    STEP 2 → Look at results:
+        a) 0 orders → tell them there are no orders on this account.
+        b) 1 order  → proceed with it directly, no need to ask.
+        c) 2+ orders → list them in plain language and ask which one.
+           Format: item names, order date, status. NO raw order IDs.
+           Example: "You have 2 orders:
+           1. Linen Shirt — Apr 1 — In Transit
+           2. Sneakers — Mar 15 — Delivered
+           Which one are you asking about?"
+- Only call get_order_details(order_id) AFTER the customer confirms which order.
+- "The recent one" or "the latest" = sufficient confirmation. Use most recent active order.
+- Never ask the customer for their order ID.
 
 KNOWLEDGE CONTEXT:
 {knowledge_context}
@@ -64,39 +87,52 @@ async def run_agent(
     # 2. Build message history
     messages: list[Message] = []
 
-    # Inject prior history if provided
     if history:
         messages.extend(history)
 
-    # Add context hints if customer provided email or order_id
+    # 3. Inject customer identity as a system-level hint at the top of the
+    #    conversation (only on the first turn — history already has it after that).
+    #    We use a concise, factual format so the LLM treats it as ground truth.
+    is_first_turn = not history  # no history = first message in this session
+
     user_content = request.message
-    if request.user_email and request.order_id:
-        user_content = (
-            f"[Customer email: {request.user_email} | Order ID: {request.order_id}]\n"
-            f"{request.message}"
-        )
-    elif request.user_email:
-        user_content = (
-            f"[Customer email: {request.user_email}]\n"
-            f"{request.message}"
-        )
-    elif request.order_id:
-        user_content = (
-            f"[Order ID: {request.order_id}]\n"
-            f"{request.message}"
-        )
+
+    if is_first_turn:
+        # Build identity header once, at session start
+        identity_parts = []
+        if request.user_email:
+            identity_parts.append(f"Customer email: {request.user_email}")
+
+        # Only inject order_id if it was explicitly confirmed by the user
+        # (i.e. passed from frontend after disambiguation — not auto-picked)
+        if request.order_id:
+            identity_parts.append(f"Confirmed order ID: {request.order_id}")
+
+        if identity_parts:
+            header = "[" + " | ".join(identity_parts) + "]"
+            user_content = f"{header}\n{request.message}"
+    else:
+        # On follow-up turns, the identity is already in history.
+        # Only re-inject email if a confirmed order_id was just provided
+        # (customer confirmed which order they meant).
+        if request.order_id:
+            user_content = (
+                f"[Confirmed order ID: {request.order_id}]\n"
+                f"{request.message}"
+            )
 
     messages.append(Message(role=Role.user, content=user_content))
 
-    # 3. Run LLM
+    # 4. Run LLM
     logger.info(
         f"Running agent — session={request.session_id} "
-        f"email={request.user_email} order={request.order_id}"
+        f"email={request.user_email} order={request.order_id} "
+        f"first_turn={is_first_turn}"
     )
 
     response = await llm.chat(
         messages      = messages,
-        tools         = [],   # tools are already registered in GroqService
+        tools         = [],   # tools are registered in GroqService
         system_prompt = system_prompt,
     )
 
