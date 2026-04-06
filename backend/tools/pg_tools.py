@@ -150,6 +150,7 @@ class GetOrderDetailsPG(BaseTool):
         except Exception as e:
             logger.exception(f"get_order_details_pg failed for {email}")
             return self.error(f"Failed to retrieve orders: {str(e)}")
+        
 def get_all_pg_tools(session_factory) -> list[BaseTool]:
         return [
         GetOrderDetailsPG(session_factory),
