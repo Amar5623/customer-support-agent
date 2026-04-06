@@ -8,30 +8,26 @@ from pymongo import DESCENDING
 
 from backend.agent.loop import run_agent
 from backend.agent.schemas import ChatRequest, ChatResponse
-from backend.api.dependencies import get_groq, get_policy, get_current_user
+from backend.api.dependencies import get_groq, get_policy, get_current_user, get_tools
 from backend.policies.file_store import FilePolicyStore
 from backend.services.llm_base import LLMBase
 from backend.services.conversation_store import ConversationStore
 from backend.api.dependencies import get_conversations
 from backend.agent.schemas import Message, Role
-from backend.database import get_db
-from motor.motor_asyncio import AsyncIOMotorDatabase
+from backend.database import get_db                          # ← add this
+from motor.motor_asyncio import AsyncIOMotorDatabase         # ← add this too
 from bson import ObjectId
+from backend.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 class ChatInput(BaseModel):
-    """
-    What the frontend sends.
-    order_id is optional — only set it when the customer has explicitly
-    confirmed which order they're asking about (after disambiguation).
-    Do NOT auto-populate this from the first order you find.
-    """
+    """What the frontend sends — no email needed, comes from JWT."""
     message:    str = Field(..., min_length=1, max_length=2000)
     session_id: str
-    order_id:   str | None = None   # only set after customer confirms
+    order_id:   str | None = None
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -42,6 +38,7 @@ async def chat(
     policy:        FilePolicyStore   = Depends(get_policy),
     conversations: ConversationStore = Depends(get_conversations),
     db: AsyncIOMotorDatabase = Depends(get_db),
+    tools:         list[BaseTool]       = Depends(get_tools),
 ):
     try:
         # Ensure conversation document exists for this session
@@ -54,8 +51,6 @@ async def chat(
             message    = body.message,
             session_id = body.session_id,
             user_email = current_user.get("email"),
-            # Only pass order_id if the frontend explicitly provided one
-            # (meaning the customer already confirmed which order they mean)
             order_id   = body.order_id,
         )
 
@@ -64,23 +59,27 @@ async def chat(
             user_id    = str(current_user["_id"]),
         )
 
-        # Convert stored dicts to Message objects the agent understands.
-        # Skip any sentinel rows (notifications stored with non-standard roles).
+        # Convert stored dicts to Message objects the agent understands
+        VALID_ROLES = {"user", "assistant", "tool"}
+
         history: list[Message] = [
-            Message(role=Role(m["role"]), content=m["content"])
+            Message(
+                role         = Role(m["role"]),
+                content      = m["content"],
+                tool_call_id = m.get("tool_call_id"),
+            )
             for m in conv.get("messages", [])
-            if m["role"] in ("user", "assistant")
+            if m["role"] in VALID_ROLES
         ]
 
         response = await run_agent(
             request      = request,
             llm          = llm,
             policy_store = policy,
+            tools = tools,
             history      = history,
         )
 
-        # If the agent called change_delivery_date, backfill the session_id
-        # onto the pending request so the WS notification can find this session.
         if any(tc.tool_name == "change_delivery_date" for tc in response.tool_calls):
             await db.pending_requests.find_one_and_update(
                 {
@@ -92,12 +91,14 @@ async def chat(
                 sort=[("created_at", DESCENDING)],
             )
 
+
         # Save turn to conversation history
         await conversations.append_turn(
             session_id   = body.session_id,
             user_message = body.message,
             bot_reply    = response.message,
             tool_calls   = response.tool_calls,
+            tool_results = response.tool_results,
         )
 
         return ChatResponse(
@@ -109,7 +110,6 @@ async def chat(
     except Exception as e:
         logger.exception(f"Chat failed — session={body.session_id}")
         raise HTTPException(status_code=500, detail="Something went wrong.")
-
 
 @router.get("/conversations")
 async def get_conversations_history(
@@ -138,7 +138,6 @@ async def close_conversation(
     if session_id:
         await conversations.close_session(session_id)
     return {"status": "closed"}
-
 
 @router.get("/session/new")
 async def new_session():

@@ -1,4 +1,7 @@
 # backend/tools/mongo_tools.py
+# Diff from original: ChangeDeliveryDate.execute() now calls
+# ws_manager.broadcast_to_admins() after inserting a pending_request,
+# so the CRM gets a push instead of waiting for a 10s poll.
 
 import logging
 from datetime import datetime, timezone, timedelta
@@ -351,8 +354,12 @@ class ChangeDeliveryDate(BaseTool):
             "Request a change to the estimated delivery date of an order. "
             "Automatically approves or creates a pending request based on warehouse schedule. "
             "Use when the customer asks to change, reschedule, or delay their delivery. "
-            "If the customer hasn't specified which order, call get_order_history first "
-            "and confirm the order before calling this tool."
+            "If the customer hasn't specified which order, call get_order_history first. "
+            "IMPORTANT: If the customer says 'sooner' or gives no specific date, you MUST "
+            "call get_order_details first to read estimated_warehouse_date, then compute "
+            "earliest_possible = estimated_warehouse_date + 1 day, tell the customer that "
+            "exact date, and wait for confirmation before calling this tool. "
+            "Never call this tool with a guessed or invented date."
         )
 
     @property
@@ -499,6 +506,20 @@ class ChangeDeliveryDate(BaseTool):
                     }
                 }}
             )
+
+            # ── FIX: push to all connected CRM admin tabs immediately.
+            # Import here (not at module top) to avoid circular imports since
+            # ws_manager lives in the api layer.
+            try:
+                from backend.api.websocket import ws_manager
+                await ws_manager.broadcast_to_admins({
+                    "type":       "new_request",
+                    "request_id": request_id,
+                    "order_id":   order_id,
+                })
+            except Exception as broadcast_err:
+                # Never let a failed broadcast block the tool response.
+                logger.warning(f"Admin broadcast failed: {broadcast_err}")
 
             return self.success({
                 "outcome":   "pending_approval",

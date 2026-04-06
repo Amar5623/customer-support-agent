@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     Validated at startup — if something is missing, the app fails fast.
     """
 
+    db_tool_mode: Literal["mongo", "postgres"] = Field(default="mongo")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

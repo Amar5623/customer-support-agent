@@ -1,5 +1,3 @@
-# backend/api/auth.py
-
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -149,3 +147,4 @@ async def get_me(
     # We'll add the current_user dependency after dependencies.py is updated
 ):
     return {"message": "Auth working"}
+
