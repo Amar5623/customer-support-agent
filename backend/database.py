@@ -13,13 +13,16 @@ _client: AsyncIOMotorClient | None = None
 async def connect_db() -> None:
     global _client
 
+    if settings.db_tool_mode != "mongo":
+        logger.info("DB_TOOL_MODE is not mongo — skipping MongoDB.")
+        return
+
     _client = AsyncIOMotorClient(
         settings.mongo_uri,
         serverSelectionTimeoutMS=settings.mongo_connect_timeout_ms,
         tls=True,
-        tlsAllowInvalidCertificates=True,   # only for dev
+        tlsAllowInvalidCertificates=True,
     )
-
     await _client.admin.command("ping")
     logger.info(f"MongoDB connected — db: {settings.mongo_db_name}")
 
@@ -32,6 +35,8 @@ async def disconnect_db() -> None:
 
 
 def get_db() -> AsyncIOMotorDatabase:
+    if settings.db_tool_mode != "mongo":
+        return None
     if _client is None:
         raise RuntimeError("Database not connected. Call connect_db() first.")
     return _client[settings.mongo_db_name]

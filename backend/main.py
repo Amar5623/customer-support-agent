@@ -22,28 +22,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting {settings.app_name} [{settings.environment}]")
     logger.info(f"Config: {settings.redacted_summary()}")
 
-    await connect_db()
-    init_container(get_db())
-
-    if settings.postgres_uri:
-        await connect_pg()
-    else:
-        logger.info("PostgreSQL not configured — skipping.")
+    await connect_db()         # skips if db_tool_mode != mongo
+    await connect_pg()         # skips if db_tool_mode != postgres
+    init_container(get_db())   # builds container with whatever is ready
 
     logger.info("Application ready.")
     yield
 
     logger.info("Shutting down...")
     await disconnect_db()
-
-    if settings.postgres_uri:
-        await disconnect_pg()
+    await disconnect_pg()
 
 
 app = FastAPI(
