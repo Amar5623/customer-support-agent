@@ -1,7 +1,7 @@
 # backend/services/conversation_store.py
 
+import json
 import logging
-import uuid
 from datetime import datetime, timezone
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -15,13 +15,18 @@ from backend.models.conversation import Conversation, ConversationMessage
 logger   = logging.getLogger(__name__)
 settings = get_settings()
 
+# Must match the marker used in groq_service._build_messages for decoding.
+# When the agent calls tools, we encode the tool call as an assistant message
+# with this prefix so the LLM can replay its own reasoning on the next turn.
+_TOOL_CALLS_MARKER = "__tool_calls__:"
+
 
 class ConversationStore:
-    def __init__(self, db, session_factory=None):
-        self._db              = db               # Mongo db or None
-        self._session_factory = session_factory  # PG session factory or None
+    def __init__(self, db=None, session_factory=None):
+        self._db              = db
+        self._session_factory = session_factory
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
     async def get_or_create(self, session_id: str, user_id: str) -> dict:
         if settings.db_tool_mode == "postgres":
@@ -34,12 +39,38 @@ class ConversationStore:
         user_message: str,
         bot_reply:    str,
         tool_calls:   list = [],
-        tool_results: list = [],   # ← ADD
+        tool_results: list = [],
+    ) -> None:
+        """
+        Persist a full conversation turn including any intermediate tool calls.
+
+        Stored as an ordered sequence of messages per turn:
+          1. user message
+          2. [if tools were called] assistant message encoding the tool call(s)
+          3. [if tools were called] one tool-result message per tool call
+          4. final assistant text reply
+
+        This sequence is what groq_service._build_messages() needs to reconstruct
+        proper Groq API message history on the next turn.
+        """
+        if settings.db_tool_mode == "postgres":
+            return await self._pg_append_turn(
+                session_id, user_message, bot_reply, tool_calls, tool_results
+            )
+        return await self._mongo_append_turn(
+            session_id, user_message, bot_reply, tool_calls, tool_results
+        )
+
+    async def append_notification(
+        self,
+        session_id: str,
+        message:    str,
+        status:     str,
     ) -> None:
         if settings.db_tool_mode == "postgres":
-            return await self._pg_append_turn(session_id, user_message, bot_reply, tool_calls)
-        return await self._mongo_append_turn(session_id, user_message, bot_reply, tool_calls, tool_results)
-    
+            return await self._pg_append_notification(session_id, message, status)
+        return await self._mongo_append_notification(session_id, message, status)
+
     async def close_session(self, session_id: str) -> None:
         if settings.db_tool_mode == "postgres":
             return await self._pg_close_session(session_id)
@@ -70,42 +101,53 @@ class ConversationStore:
         doc["_id"] = result.inserted_id
         return doc
 
-    async def _mongo_append_turn(self, session_id, user_message, bot_reply, tool_calls, tool_results=None):
-        import json
+    async def _mongo_append_turn(
+        self,
+        session_id:   str,
+        user_message: str,
+        bot_reply:    str,
+        tool_calls:   list,
+        tool_results: list,
+    ) -> None:
         now = datetime.now(timezone.utc)
-        messages_to_add = []
 
-        # 1. User message
-        messages_to_add.append({
-            "role":      "user",
-            "content":   user_message,
-            "timestamp": now,
-        })
+        # Build the ordered message sequence for this turn.
+        messages_to_add = [
+            {"role": "user", "content": user_message, "timestamp": now}
+        ]
 
-        # 2. If tools were called, save the encoded tool_calls assistant row
-        #    so _build_messages() can reconstruct it on the next turn
         if tool_calls:
-            encoded_payload = json.dumps([
-                {"id": tc.id, "name": tc.tool_name, "arguments": tc.arguments}
+            # ── Step 2: Encode the assistant's tool call decision ──────────────
+            # groq_service._build_messages() will decode this back into a proper
+            # Groq "assistant + tool_calls" message on the next turn.
+            tc_payload = [
+                {
+                    "id":        tc.id,
+                    "name":      tc.tool_name,
+                    "arguments": tc.arguments,   # dict, not string
+                }
                 for tc in tool_calls
-            ])
+            ]
             messages_to_add.append({
                 "role":      "assistant",
-                "content":   f"__tool_calls__:{encoded_payload}",
+                "content":   f"{_TOOL_CALLS_MARKER}{json.dumps(tc_payload)}",
                 "timestamp": now,
             })
 
-        # 3. Save each tool result row (so the model sees what tools returned)
-        if tool_results:
+            # ── Step 3: One tool-result message per tool call ──────────────────
+            # Build a lookup so we can attach the tool name to each result.
+            tc_id_to_name = {tc.id: tc.tool_name for tc in tool_calls}
+
             for tr in tool_results:
                 messages_to_add.append({
                     "role":         "tool",
                     "content":      tr.content,
                     "tool_call_id": tr.tool_call_id,
+                    "name":         tc_id_to_name.get(tr.tool_call_id, "unknown"),
                     "timestamp":    now,
                 })
 
-        # 4. Final assistant reply (the clean text shown to user)
+        # ── Step 4: Final assistant text reply ────────────────────────────────
         messages_to_add.append({
             "role":      "assistant",
             "content":   bot_reply,
@@ -117,6 +159,21 @@ class ConversationStore:
             {
                 "$push": {"messages": {"$each": messages_to_add}},
                 "$set":  {"last_active": now, "status": "active"},
+            }
+        )
+
+    async def _mongo_append_notification(self, session_id, message, status):
+        now = datetime.now(timezone.utc)
+        await self._db.conversations.update_one(
+            {"session_id": session_id},
+            {
+                "$push": {"messages": {
+                    "role":      "notification",
+                    "content":   message,
+                    "status":    status,
+                    "timestamp": now,
+                }},
+                "$set": {"last_active": now},
             }
         )
 
@@ -139,29 +196,22 @@ class ConversationStore:
 
         conversations = []
         async for conv in cursor:
-            ui_messages = []
-            for m in conv.get("messages", []):
-                role = m["role"]
-                if role in ("user", "assistant"):
-                    ui_messages.append({
-                        "role":      role,
-                        "content":   m["content"],
-                        "timestamp": m["timestamp"].isoformat(),
-                    })
-                elif role == "notification":
-                    ui_messages.append({
-                        "role":      "notification",
-                        "content":   m["content"],
-                        "status":    m.get("status", "approved"),
-                        "timestamp": m["timestamp"].isoformat(),
-                    })
-                # tool_call / tool_result rows: skipped — UI doesn't render them
-
             conversations.append({
                 "session_id":  conv["session_id"],
                 "created_at":  conv["created_at"].isoformat(),
                 "last_active": conv["last_active"].isoformat(),
-                "messages":    ui_messages,
+                "messages": [
+                    {
+                        "role":         m["role"],
+                        "content":      m["content"],
+                        "timestamp":    m["timestamp"].isoformat(),
+                        "status":       m.get("status"),
+                        # These are only present on tool messages — None for all others.
+                        "tool_call_id": m.get("tool_call_id"),
+                        "name":         m.get("name"),
+                    }
+                    for m in conv.get("messages", [])
+                ]
             })
         return conversations
 
@@ -185,12 +235,11 @@ class ConversationStore:
                 status      = "active",
                 created_at  = now,
                 last_active = now,
-                messages    = [],   # ← set empty list directly, no lazy load
+                messages    = [],
             )
             session.add(conv)
             await session.commit()
 
-            # ── re-fetch with eager load instead of refresh ──
             result = await session.execute(
                 select(Conversation)
                 .where(Conversation.session_id == session_id)
@@ -199,27 +248,84 @@ class ConversationStore:
             conv = result.scalar_one()
             return self._pg_conv_to_dict(conv)
 
-    async def _pg_append_turn(self, session_id, user_message, bot_reply, tool_calls):
+    async def _pg_append_turn(
+        self,
+        session_id:   str,
+        user_message: str,
+        bot_reply:    str,
+        tool_calls:   list,
+        tool_results: list,
+    ) -> None:
         now = datetime.now(timezone.utc)
         async with self._session_factory() as session:
+
+            # 1. User message
             session.add(ConversationMessage(
-                session_id = session_id,
-                role       = "user",
-                content    = user_message,
-                tool_calls = [],
-                timestamp  = now,
+                session_id   = session_id,
+                role         = "user",
+                content      = user_message,
+                timestamp    = now,
             ))
+
+            if tool_calls:
+                # 2. Assistant tool-call decision (encoded with marker)
+                tc_payload = [
+                    {
+                        "id":        tc.id,
+                        "name":      tc.tool_name,
+                        "arguments": tc.arguments,
+                    }
+                    for tc in tool_calls
+                ]
+                session.add(ConversationMessage(
+                    session_id = session_id,
+                    role       = "assistant",
+                    content    = f"{_TOOL_CALLS_MARKER}{json.dumps(tc_payload)}",
+                    timestamp  = now,
+                ))
+
+                # 3. Tool result messages
+                tc_id_to_name = {tc.id: tc.tool_name for tc in tool_calls}
+                for tr in tool_results:
+                    session.add(ConversationMessage(
+                        session_id   = session_id,
+                        role         = "tool",
+                        content      = tr.content,
+                        tool_call_id = tr.tool_call_id,
+                        name         = tc_id_to_name.get(tr.tool_call_id, "unknown"),
+                        timestamp    = now,
+                    ))
+
+            # 4. Final assistant text reply
             session.add(ConversationMessage(
                 session_id = session_id,
                 role       = "assistant",
                 content    = bot_reply,
-                tool_calls = [t.tool_name for t in tool_calls],
+                timestamp  = now,
+            ))
+
+            await session.execute(
+                update(Conversation)
+                .where(Conversation.session_id == session_id)
+                .values(last_active=now, status="active")
+            )
+            await session.commit()
+
+    async def _pg_append_notification(self, session_id, message, status):
+        now = datetime.now(timezone.utc)
+        async with self._session_factory() as session:
+            session.add(ConversationMessage(
+                session_id = session_id,
+                role       = "notification",
+                content    = message,
+                # Reuse the `name` field to carry the status string for notifications.
+                name       = status,
                 timestamp  = now,
             ))
             await session.execute(
                 update(Conversation)
                 .where(Conversation.session_id == session_id)
-                .values(last_active=now, status="active")
+                .values(last_active=now)
             )
             await session.commit()
 
@@ -253,9 +359,13 @@ class ConversationStore:
             "last_active": conv.last_active.isoformat(),
             "messages": [
                 {
-                    "role":      m.role,
-                    "content":   m.content,
-                    "timestamp": m.timestamp.isoformat(),
+                    "role":         m.role,
+                    "content":      m.content,
+                    "timestamp":    m.timestamp.isoformat(),
+                    # For notifications, status was stored in the `name` field.
+                    "status":       m.name if m.role == "notification" else None,
+                    "tool_call_id": m.tool_call_id,
+                    "name":         m.name if m.role != "notification" else None,
                 }
                 for m in (conv.messages or [])
             ]
