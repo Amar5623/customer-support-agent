@@ -4,7 +4,8 @@ import logging
 from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from datetime import datetime
+import uuid
 from backend.tools.base import BaseTool
 
 logger = logging.getLogger(__name__)
@@ -428,12 +429,207 @@ class GetOrderStatusPG(BaseTool):
             logger.exception(f"get_order_status_pg failed for email={email}, order_id={order_id}")
             return self.error(f"Failed to retrieve order status: {str(e)}")
 
+# ── 4. Change Delivery Date ─────────────────────────────────────────────────
 
+class ChangeDeliveryDatePG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+ 
+    @property
+    def name(self) -> str:
+        return "change_delivery_date"
+ 
+    @property
+    def description(self) -> str:
+        return (
+            "Request a change to the estimated delivery date of an order. "
+            "Creates a pending request for admin approval. "
+            "Use when the customer asks to change, reschedule, or delay their delivery. "
+            "If the customer hasn't specified which order, call get_order_history first. "
+            "Never call this tool with a guessed or invented date."
+        )
+ 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "description": "Customer's email address"
+                },
+                "order_id": {
+                    "type": "string",
+                    "description": "The order ID confirmed by the customer"
+                },
+                "requested_date": {
+                    "type": "string",
+                    "description": "Requested new delivery date in YYYY-MM-DD format"
+                }
+            },
+            "required": ["email", "order_id", "requested_date"]
+        }
+ 
+    async def execute(self, **kwargs: Any) -> dict:
+        email          = kwargs.get("email", "").strip().lower()
+        order_id       = kwargs.get("order_id", "").strip()
+        requested_date = kwargs.get("requested_date", "").strip()
+ 
+        if not email:
+            return self.error("email is required.")
+        if not order_id:
+            return self.error("order_id is required.")
+        if not requested_date:
+            return self.error("requested_date is required.")
+ 
+        try:
+            req_dt = datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            return self.error(
+                f"Invalid date format '{requested_date}'. Please use YYYY-MM-DD."
+            )
+ 
+        if req_dt.date() <= datetime.utcnow().date():
+            return self.error("Requested date must be in the future.")
+ 
+        try:
+            async with self._session_factory() as session:
+ 
+                # ── 1. Verify user ───────────────────────────────────────
+                user_result = await session.execute(
+                    text("SELECT id FROM users WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+ 
+                user_id = user["id"]
+ 
+                # ── 2. Verify order ownership ────────────────────────────
+                customer_result = await session.execute(
+                    text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                customer = customer_result.mappings().first()
+                if not customer:
+                    return self.error("No order history found for this account.")
+ 
+                order_result = await session.execute(
+                    text("""
+                        SELECT order_id, order_status, order_estimated_delivery_date
+                        FROM orders
+                        WHERE order_id    = :order_id
+                          AND customer_id = :customer_id
+                    """),
+                    {"order_id": order_id, "customer_id": customer["customer_id"]}
+                )
+                order = order_result.mappings().first()
+                if not order:
+                    return self.error(f"No order found with ID {order_id}.")
+ 
+                # ── 3. Check terminal states ─────────────────────────────
+                status = order["order_status"]
+                if status in ("delivered", "cancelled"):
+                    return self.success({
+                        "outcome":  "rejected",
+                        "reason":   (
+                            f"Your order is already '{status}' — "
+                            "the delivery date cannot be changed at this stage."
+                        ),
+                        "email":    email,
+                        "order_id": order_id,
+                    })
+ 
+                # ── 4. Check for existing pending request ────────────────
+                existing_result = await session.execute(
+                    text("""
+                        SELECT id, requested_date
+                        FROM pending_requests
+                        WHERE order_id = :order_id
+                          AND status   = 'pending'
+                        LIMIT 1
+                    """),
+                    {"order_id": order_id}
+                )
+                existing = existing_result.mappings().first()
+                if existing:
+                    return self.success({
+                        "outcome": "already_pending",
+                        "reason":  (
+                            "There is already a pending date change request for this order. "
+                            "Our team is reviewing it and will confirm within 24 hours. "
+                            "Please wait for that confirmation before submitting a new request."
+                        ),
+                        "existing_requested_date": str(existing["requested_date"]),
+                        "request_id":              existing["id"],
+                        "email":                   email,
+                        "order_id":                order_id,
+                    })
+ 
+                # ── 5. Insert pending request (session_id left NULL here) ─
+                #       routes.py will backfill it immediately after the agent
+                #       returns, using the route's own injected pg_session.
+                now        = datetime.utcnow()
+                request_id = str(uuid.uuid4())
+ 
+                await session.execute(
+                    text("""
+                        INSERT INTO pending_requests
+                            (id, type, status, order_id, user_id,
+                             requested_date, "current_date", session_id, created_at)
+                        VALUES
+                            (:id, :type, :status, :order_id, :user_id,
+                             :requested_date, :current_date, NULL, :created_at)
+                    """),
+                    {
+                        "id":             request_id,
+                        "type":           "date_change",
+                        "status":         "pending",
+                        "order_id":       order_id,
+                        "user_id":        user_id,
+                        "requested_date": req_dt,
+                        "current_date":   order["order_estimated_delivery_date"],
+                        "created_at":     now,
+                    }
+                )
+                await session.commit()
+ 
+                # ── 6. Broadcast to admin CRM ────────────────────────────
+                try:
+                    from backend.api.websocket import ws_manager
+                    await ws_manager.broadcast_to_admins({
+                        "type":       "new_request",
+                        "request_id": request_id,
+                        "order_id":   order_id,
+                    })
+                except Exception as broadcast_err:
+                    logger.warning(f"Admin broadcast failed: {broadcast_err}")
+ 
+                return self.success({
+                    "outcome":        "pending_approval",
+                    "request_id":     request_id,
+                    "message":        (
+                        "Your request has been submitted for review. "
+                        "Our team will confirm within 24 hours."
+                    ),
+                    "requested_date": requested_date,
+                    "email":          email,
+                    "order_id":       order_id,
+                })
+ 
+        except Exception as e:
+            logger.exception(f"change_delivery_date failed for {order_id}")
+            return self.error(f"Failed to process date change request: {str(e)}")
+ 
+ 
 # ── Registry ────────────────────────────────────────────────────────────────────
-
+ 
 def get_all_pg_tools(session_factory) -> list[BaseTool]:
     return [
         GetOrderHistoryPG(session_factory),
         GetOrderDetailsPG(session_factory),
         GetOrderStatusPG(session_factory),
+        ChangeDeliveryDatePG(session_factory),
     ]
+ 
