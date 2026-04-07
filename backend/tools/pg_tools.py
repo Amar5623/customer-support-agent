@@ -946,6 +946,7 @@ class GetPaymentInfoPG(BaseTool):
                 ]
  
                 return self.success({
+                    "email":           email,
                     "order_id":        order_id,
                     "is_latest_order": is_latest,
                     "order_status":    order["order_status"],
