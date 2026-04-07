@@ -4,8 +4,7 @@ import json
 import logging
 from typing import Any
 
-from groq import AsyncGroq
-
+from groq import AsyncGroq, BadRequestError
 from backend.agent.schemas import AgentResponse, Message, Role, ToolCall, ToolResult
 from backend.core.config import get_settings
 from backend.services.llm_base import LLMBase
@@ -41,11 +40,11 @@ class GroqService(LLMBase):
         self._schemas = [tool.to_groq_schema() for tool in tools]
 
     async def chat(
-        self,
-        messages:      list[Message],
-        tools:         list[BaseTool],
-        system_prompt: str,
-    ) -> AgentResponse:
+    self,
+    messages:      list[Message],
+    tools:         list[BaseTool],
+    system_prompt: str,
+) -> AgentResponse:
 
         groq_messages     = self._build_messages(messages, system_prompt)
         all_tool_calls:   list[ToolCall]   = []
@@ -119,8 +118,8 @@ class GroqService(LLMBase):
                     "tool_calls": message.tool_calls,
                 })
 
-                tool_result_dicts, tool_calls_made, tool_results_made = (
-                    await self._execute_tool_calls(message.tool_calls)
+                tool_result_dicts, tool_calls_made, tool_results_made = await self._execute_tool_calls(
+                    message.tool_calls
                 )
                 all_tool_calls.extend(tool_calls_made)
                 all_tool_results.extend(tool_results_made)
@@ -238,7 +237,7 @@ class GroqService(LLMBase):
             tool = self._tools.get(tool_name)
             if not tool:
                 result = {"success": False, "error": f"Unknown tool: {tool_name}"}
-                logger.warning(f"Groq called unknown tool: {tool_name}")
+                logger.error(f"Groq called unknown tool '{tool_name}'. Available: {list(self._tools.keys())}")
             else:
                 logger.info(f"Executing tool: {tool_name} with args: {arguments}")
                 result = await tool.execute(**arguments)

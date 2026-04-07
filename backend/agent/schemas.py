@@ -16,8 +16,8 @@ class Role(str, Enum):
 class Message(BaseModel):
     role:         Role
     content:      str
-    tool_call_id: str | None = None   # only for role=tool responses
-    name:         str | None = None   # tool name, only for role=tool
+    tool_call_id: str | None = None
+    name:         str | None = None
 
 
 class ToolCall(BaseModel):
@@ -27,15 +27,14 @@ class ToolCall(BaseModel):
 
 
 class ToolResult(BaseModel):
-    """Raw Groq tool result dict — stored so it can be replayed next turn."""
     tool_call_id: str
-    content:      str   # JSON string of the tool's return value
+    content:      str
 
 
 class AgentResponse(BaseModel):
     message:       str
     tool_calls:    list[ToolCall]  = []
-    tool_results:  list[ToolResult] = []   # ← NEW: parallel to tool_calls
+    tool_results:  list[ToolResult] = []
     was_escalated: bool = False
     error:         str | None = None
 
