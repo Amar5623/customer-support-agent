@@ -38,6 +38,15 @@ def _serialize(doc: dict) -> dict:
             result[k] = v
     return result
 
+def serialize_dates(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, list):
+        return [serialize_dates(i) for i in obj]
+    if isinstance(obj, dict):
+        return {k: serialize_dates(v) for k, v in obj.items()}
+    return obj
+
 
 # ── 1. Get Order Details ────────────────────────────────────────────────────────
 
@@ -646,6 +655,8 @@ class ChangeDeliveryAddress(BaseTool):
             logger.exception(f"change_delivery_address failed for {order_id}")
             return self.error(f"Failed to update address: {str(e)}")
 
+# ── 7. Get Order Tracking ──────────────────────────────────────────────────
+
 class GetOrderTracking(BaseTool):
     def __init__(self, db: AsyncIOMotorDatabase):
         self._db = db
@@ -676,37 +687,42 @@ class GetOrderTracking(BaseTool):
                 },
                 "email": {
                     "type": "string",
-                    "description": "Customer email for ownership verification (recommended)"
+                    "description": "The customer's email address"
                 }
             },
-            "required": ["order_id"]
+            "required": ["order_id", "email"]
         }
 
     async def execute(self, **kwargs: Any) -> dict:
         order_id = kwargs.get("order_id", "").strip()
-        email = kwargs.get("email", "").strip().lower()
+        email    = kwargs.get("email", "").strip().lower()
 
         if not order_id:
             return self.error("order_id is required.")
+        if not email:
+            return self.error("email is required.")
 
         try:
             oid = ObjectId(order_id)
         except Exception:
             return self.error("Invalid order ID format.")
 
+        # Resolve user from email
+        user = await self._db.users.find_one(
+            {"email": {"$regex": f"^{email}$", "$options": "i"}},
+            {"_id": 1}
+        )
+        if not user:
+            return self.error(f"No account found for email: {email}")
+
         # Fetch main order
         order = await self._db.orders.find_one({"_id": oid})
         if not order:
             return self.error(f"No order found with ID {order_id}.")
 
-        # Optional: Verify ownership if email provided
-        if email:
-            user = await self._db.users.find_one(
-                {"email": {"$regex": f"^{email}$", "$options": "i"}},
-                {"_id": 1}
-            )
-            if user and str(user["_id"]) != str(order.get("userId")):
-                return self.error("This order does not belong to the provided email.")
+        # Verify ownership
+        if str(user["_id"]) != str(order.get("userId")):
+            return self.error("This order does not belong to the provided email.")
 
         # Enrich with invoice
         invoice = None
@@ -727,7 +743,6 @@ class GetOrderTracking(BaseTool):
             "estimated_warehouse_date": order.get("estimated_warehouse_date").isoformat() if isinstance(order.get("estimated_warehouse_date"), datetime) else None,
             "estimated_shipped_date": order.get("estimated_shipped_date").isoformat() if isinstance(order.get("estimated_shipped_date"), datetime) else None,
             "estimated_destination_date": order.get("estimated_destination_date").isoformat() if isinstance(order.get("estimated_destination_date"), datetime) else None,
-            
             "shipping_address": order.get("shipping_address", {}),
             "products": [
                 {
@@ -736,22 +751,21 @@ class GetOrderTracking(BaseTool):
                 } for p in order.get("products", [])
             ],
             "delivery_date_change_request": order.get("delivery_date_change_request"),
-            
             "invoice": {
                 "total_amount": invoice.get("totalAmount") if invoice else order.get("totalAmount"),
                 "status": invoice.get("status") if invoice else None,
                 "invoice_number": invoice.get("metadata", {}).get("erpDetails", {}).get("invoiceNumber") if invoice else None,
             } if invoice or "totalAmount" in order else None,
-            
             "return_status": _serialize(return_doc) if return_doc else None,
-            
-            "status_history": order.get("status_history", [])
+            "status_history": serialize_dates(order.get("status_history", []))
         }
 
-        return self.success({
+        return self.success(serialize_dates({
             "tracking": tracking,
             "message": "Here is the complete tracking information for your order."
-        })
+        }))
+
+# ── 8. Get Invoice Details ──────────────────────────────────────────────────
 
 class GetInvoiceDetails(BaseTool):
     def __init__(self, db: AsyncIOMotorDatabase):
@@ -782,72 +796,67 @@ class GetInvoiceDetails(BaseTool):
                     "type": "string",
                     "description": "The specific order ID for which invoice details are needed"
                 },
-                "invoice_id": {
-                    "type": "string",
-                    "description": "Direct invoice ID (optional, use only if customer provides it)"
-                },
                 "email": {
                     "type": "string",
-                    "description": "Customer email for ownership verification (recommended)"
+                    "description": "The customer's email address"
                 }
             },
-            "required": []
+            "required": ["order_id", "email"]
         }
 
     async def execute(self, **kwargs: Any) -> dict:
         order_id = kwargs.get("order_id", "").strip()
-        invoice_id = kwargs.get("invoice_id", "").strip()
-        email = kwargs.get("email", "").strip().lower()
+        email    = kwargs.get("email", "").strip().lower()
 
-        if not order_id and not invoice_id:
-            return self.error("Either order_id or invoice_id is required.")
+        if not order_id:
+            return self.error("order_id is required.")
+        if not email:
+            return self.error("email is required.")
 
         try:
+            # Resolve user from email
+            user = await self._db.users.find_one(
+                {"email": {"$regex": f"^{email}$", "$options": "i"}},
+                {"_id": 1}
+            )
+            if not user:
+                return self.error(f"No account found for email: {email}")
+
+            # Fetch order and verify ownership
+            order = await self._db.orders.find_one({"_id": ObjectId(order_id)})
+            if not order:
+                return self.error(f"No order found with ID {order_id}")
+
+            if str(user["_id"]) != str(order.get("userId")):
+                return self.error("This order does not belong to the provided email.")
+
+            # Fetch invoice via invoiceId on the order
             invoice = None
-
-            # Lookup by order_id (most common case)
-            if order_id:
-                order = await self._db.orders.find_one({"_id": ObjectId(order_id)})
-                if not order:
-                    return self.error(f"No order found with ID {order_id}")
-
-                # Ownership verification
-                if email:
-                    user = await self._db.users.find_one(
-                        {"email": {"$regex": f"^{email}$", "$options": "i"}}, {"_id": 1}
-                    )
-                    if user and str(user.get("_id")) != str(order.get("userId")):
-                        return self.error("This order does not belong to the customer.")
-
-                if order.get("invoiceId"):
-                    invoice = await self._db.invoices.find_one({"_id": ObjectId(order["invoiceId"])})
-
-            # Fallback: direct invoice lookup
-            if not invoice and invoice_id:
-                invoice = await self._db.invoices.find_one({"_id": ObjectId(invoice_id)})
+            if order.get("invoiceId"):
+                invoice = await self._db.invoices.find_one({"_id": ObjectId(order["invoiceId"])})
 
             if not invoice:
                 return self.error("No invoice found for this order.")
 
             # Extract relevant fields
-            erp = invoice.get("metadata", {}).get("erpDetails", {})
-            card = invoice.get("metadata", {}).get("creditCardProcessing", {})
+            erp     = invoice.get("metadata", {}).get("erpDetails", {})
+            card    = invoice.get("metadata", {}).get("creditCardProcessing", {})
             loyalty = invoice.get("metadata", {}).get("loyaltyRewards", {})
 
             data = {
-                "invoice_id": str(invoice.get("_id")),
-                "order_id": order_id or "N/A",
-                "invoice_number": erp.get("invoiceNumber"),
-                "status": invoice.get("status"),
-                "total_amount": invoice.get("totalAmount"),
-                "subtotal": erp.get("subtotal"),
-                "total_tax": erp.get("totalTax"),
-                "due_date": erp.get("dueDate"),
-                "payment_terms": erp.get("paymentTerms"),
-                "transaction_id": card.get("transactionId"),
-                "approval_code": card.get("approvalCode"),
-                "loyalty_points_earned": loyalty.get("pointsEarned"),
-                "loyalty_tier": loyalty.get("tier"),
+                "invoice_id":             str(invoice.get("_id")),
+                "order_id":               order_id,
+                "invoice_number":         erp.get("invoiceNumber"),
+                "status":                 invoice.get("status"),
+                "total_amount":           invoice.get("totalAmount"),
+                "subtotal":               erp.get("subtotal"),
+                "total_tax":              erp.get("totalTax"),
+                "due_date":               erp.get("dueDate"),
+                "payment_terms":          erp.get("paymentTerms"),
+                "transaction_id":         card.get("transactionId"),
+                "approval_code":          card.get("approvalCode"),
+                "loyalty_points_earned":  loyalty.get("pointsEarned"),
+                "loyalty_tier":           loyalty.get("tier"),
             }
 
             return self.success({
@@ -858,6 +867,8 @@ class GetInvoiceDetails(BaseTool):
         except Exception as e:
             logger.exception("get_invoice_details failed")
             return self.error(f"Failed to fetch invoice details: {str(e)}")
+
+# ── 9. Get Total Amount Paid ──────────────────────────────────────────────────
 
 class GetTotalAmountPaid(BaseTool):
     def __init__(self, db: AsyncIOMotorDatabase):
@@ -885,7 +896,7 @@ class GetTotalAmountPaid(BaseTool):
             "properties": {
                 "email": {
                     "type": "string",
-                    "description": "Customer email address (required)"
+                    "description": "The customer's email address"
                 }
             },
             "required": ["email"]
@@ -897,7 +908,6 @@ class GetTotalAmountPaid(BaseTool):
             return self.error("email is required.")
 
         try:
-            # Find user
             user = await self._db.users.find_one(
                 {"email": {"$regex": f"^{email}$", "$options": "i"}},
                 {"_id": 1}
@@ -907,77 +917,63 @@ class GetTotalAmountPaid(BaseTool):
 
             user_id = user["_id"]
 
-            # ✅ FIXED: join with invoices + handle missing fields + date conversion
             pipeline = [
-                        # 1. Match user orders
-                        {"$match": {"userId": user_id}},
-
-                        # 2. Normalize createdAt to Date
-                        {
-                            "$addFields": {
-                                "createdAt": {
-                                    "$cond": {
-                                        "if": {"$eq": [{"$type": "$createdAt"}, "string"]},
-                                        "then": {"$toDate": "$createdAt"},
-                                        "else": "$createdAt"
-                                    }
-                                }
-                            }
-                        },
-
-                        # 3. Lookup invoices using correct relation
-                        {
-                            "$lookup": {
-                                "from": "invoices",
-                                "localField": "_id",          # orders._id
-                                "foreignField": "orderId",    # invoices.orderId
-                                "as": "invoice"
-                            }
-                        },
-
-                        # 4. Unwind invoice (keep orders even if no invoice)
-                        {
-                            "$unwind": {
-                                "path": "$invoice",
-                                "preserveNullAndEmptyArrays": True
-                            }
-                        },
-
-                        # 5. Extract totalAmount safely
-                        {
-                            "$addFields": {
-                                "totalAmount": {
-                                    "$ifNull": ["$invoice.totalAmount", 0]
-                                }
-                            }
-                        },
-
-                        # 6. Filter out invalid totals (IMPORTANT FIX 🔥)
-                        {
-                            "$addFields": {
-                                "totalAmount": {
-                                    "$cond": {
-                                        "if": {"$isNumber": "$totalAmount"},
-                                        "then": "$totalAmount",
-                                        "else": 0
-                                    }
-                                }
-                            }
-                        },
-
-                        # 7. Group and calculate stats
-                        {
-                            "$group": {
-                                "_id": None,
-                                "total_amount_paid": {"$sum": "$totalAmount"},
-                                "total_orders": {"$sum": 1},
-                                "highest_order": {"$max": "$totalAmount"},
-                                "lowest_order": {"$min": "$totalAmount"},
-                                "first_purchase": {"$min": "$createdAt"},
-                                "last_purchase": {"$max": "$createdAt"}
+                {"$match": {"userId": user_id}},
+                {
+                    "$addFields": {
+                        "createdAt": {
+                            "$cond": {
+                                "if": {"$eq": [{"$type": "$createdAt"}, "string"]},
+                                "then": {"$toDate": "$createdAt"},
+                                "else": "$createdAt"
                             }
                         }
-                    ]
+                    }
+                },
+                {
+                    "$lookup": {
+                        "from": "invoices",
+                        "localField": "_id",
+                        "foreignField": "orderId",
+                        "as": "invoice"
+                    }
+                },
+                {
+                    "$unwind": {
+                        "path": "$invoice",
+                        "preserveNullAndEmptyArrays": True
+                    }
+                },
+                {
+                    "$addFields": {
+                        "totalAmount": {
+                            "$ifNull": ["$invoice.totalAmount", 0]
+                        }
+                    }
+                },
+                {
+                    "$addFields": {
+                        "totalAmount": {
+                            "$cond": {
+                                "if": {"$isNumber": "$totalAmount"},
+                                "then": "$totalAmount",
+                                "else": 0
+                            }
+                        }
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": None,
+                        "total_amount_paid": {"$sum": "$totalAmount"},
+                        "total_orders":      {"$sum": 1},
+                        "highest_order":     {"$max": "$totalAmount"},
+                        "lowest_order":      {"$min": "$totalAmount"},
+                        "first_purchase":    {"$min": "$createdAt"},
+                        "last_purchase":     {"$max": "$createdAt"}
+                    }
+                }
+            ]
 
             result = await self._db.orders.aggregate(pipeline).to_list(length=1)
 
@@ -988,19 +984,17 @@ class GetTotalAmountPaid(BaseTool):
                     "message": "You haven't made any purchases yet."
                 })
 
-            stats = result[0]
-
-            # Calculate average
-            average_order = round(stats["total_amount_paid"] / stats["total_orders"], 2) if stats["total_orders"] > 0 else 0
+            stats   = result[0]
+            average = round(stats["total_amount_paid"] / stats["total_orders"], 2) if stats["total_orders"] > 0 else 0
 
             data = {
-                "total_amount_paid": stats["total_amount_paid"],
-                "total_orders": stats["total_orders"],
-                "average_order_value": average_order,
-                "highest_order_amount": stats.get("highest_order", 0),
-                "lowest_order_amount": stats.get("lowest_order", 0),
-                "first_purchase_date": stats.get("first_purchase").isoformat() if isinstance(stats.get("first_purchase"), datetime) else None,
-                "last_purchase_date": stats.get("last_purchase").isoformat() if isinstance(stats.get("last_purchase"), datetime) else None,
+                "total_amount_paid":     stats["total_amount_paid"],
+                "total_orders":          stats["total_orders"],
+                "average_order_value":   average,
+                "highest_order_amount":  stats.get("highest_order", 0),
+                "lowest_order_amount":   stats.get("lowest_order", 0),
+                "first_purchase_date":   stats.get("first_purchase").isoformat() if isinstance(stats.get("first_purchase"), datetime) else None,
+                "last_purchase_date":    stats.get("last_purchase").isoformat() if isinstance(stats.get("last_purchase"), datetime) else None,
             }
 
             return self.success({
