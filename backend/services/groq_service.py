@@ -50,12 +50,7 @@ class GroqService(LLMBase):
         all_tool_calls:   list[ToolCall]   = []
         all_tool_results: list[ToolResult] = []
 
-        # ── Per-request token accumulators ────────────────────────────────────
-        total_prompt_tokens     = 0
-        total_completion_tokens = 0
-        total_tokens_used       = 0
-
-        max_iterations = settings.agent_max_iterations
+        max_iterations = settings.agent_max_iterations  # your config already has this
         iteration      = 0
 
         try:
@@ -69,33 +64,16 @@ class GroqService(LLMBase):
                     model       = self._model,
                     messages    = groq_messages,
                     tools       = self._schemas,
+                    # Force text reply on last iteration so we never exit without a message
                     tool_choice = "none" if is_last_iteration else "auto",
                     temperature = settings.groq_temperature,
                     max_tokens  = settings.groq_max_tokens,
                 )
 
-                # ── Log token usage for this API call ─────────────────────────
-                usage = response.usage
-                if usage:
-                    iter_prompt     = usage.prompt_tokens
-                    iter_completion = usage.completion_tokens
-                    iter_total      = usage.total_tokens
-
-                    total_prompt_tokens     += iter_prompt
-                    total_completion_tokens += iter_completion
-                    total_tokens_used       += iter_total
-
-                    logger.info(
-                        f"[TOKENS] Iteration {iteration} — "
-                        f"prompt: {iter_prompt} | "
-                        f"completion: {iter_completion} | "
-                        f"total: {iter_total}"
-                    )
-
                 choice  = response.choices[0]
                 message = choice.message
 
-                # ── No tool calls → model is done ─────────────────────────────
+                # ── No tool calls → model is done, return its reply ────────────
                 if not message.tool_calls:
                     # Log final cumulative totals for this full request
                     logger.info(
@@ -111,7 +89,8 @@ class GroqService(LLMBase):
                         tool_results = all_tool_results,
                     )
 
-                # ── Tool calls present → execute and loop ─────────────────────
+                # ── Tool calls present → execute them, feed results back ───────
+                # Null out any narration text (smaller models leak it mid-loop)
                 groq_messages.append({
                     "role":       "assistant",
                     "content":    None,
@@ -123,6 +102,8 @@ class GroqService(LLMBase):
                 )
                 all_tool_calls.extend(tool_calls_made)
                 all_tool_results.extend(tool_results_made)
+
+                # Append tool results — loop continues, Groq sees them next round
                 groq_messages.extend(tool_result_dicts)
 
                 logger.info(
@@ -130,14 +111,8 @@ class GroqService(LLMBase):
                     f"{[tc.tool_name for tc in tool_calls_made]}, looping..."
                 )
 
-            # Safety net — last iteration forces tool_choice=none so this
-            # should never be reached, but log totals anyway
-            logger.info(
-                f"[TOKENS] ══ REQUEST COMPLETE (max iterations) ══ "
-                f"total prompt tokens: {total_prompt_tokens} | "
-                f"total completion tokens: {total_completion_tokens} | "
-                f"TOTAL TOKENS USED: {total_tokens_used}"
-            )
+            # Should not reach here (last iteration forces tool_choice=none)
+            # but safety net just in case
             return AgentResponse(
                 message      = "I wasn't able to complete that in time. Please try again.",
                 tool_calls   = all_tool_calls,
