@@ -113,11 +113,12 @@ async def chat(
         # FIX: was spinning up a new session via `async for pg_session in
         #      get_pg_session()` which creates an unmanaged session outside DI.
 
-        date_change_called = any(
-            tc.tool_name == "change_delivery_date" for tc in response.tool_calls
-        )
+        pending_tool_called = any(
+        tc.tool_name in ("change_delivery_date", "change_delivery_address")
+        for tc in response.tool_calls
+    )
 
-        if date_change_called:
+        if pending_tool_called:
             if settings.db_tool_mode == "postgres" and pg_session is not None:
                 await pg_session.execute(
                     text("""
@@ -127,8 +128,9 @@ async def chat(
                             SELECT id
                             FROM pending_requests
                             WHERE user_id    = :user_id
-                              AND status     = 'pending'
-                              AND session_id IS NULL
+                            AND status     = 'pending'
+                            AND session_id IS NULL
+                            AND type       IN ('date_change', 'address_change')
                             ORDER BY created_at DESC
                             LIMIT 1
                         )
@@ -147,6 +149,7 @@ async def chat(
                         "user_id":    ObjectId(str(current_user["_id"])),
                         "status":     "pending",
                         "session_id": None,
+                        "type":       {"$in": ["date_change", "address_change"]},
                     },
                     {"$set": {"session_id": body.session_id}},
                     sort=[(("created_at", DESCENDING))],

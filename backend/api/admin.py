@@ -74,6 +74,14 @@ async def _pg_get_pending_requests(status: str, session: AsyncSession) -> list[d
                 pr.resolved_at,
                 pr.resolved_by,
                 pr.resolution_note,
+                pr.requested_address,
+                pr.requested_city,
+                pr.requested_state,
+                pr.requested_pincode,
+                pr.current_address,
+                pr.current_city,
+                pr.current_state,
+                pr.current_pincode,
 
                 o.order_status,
                 o.order_estimated_delivery_date,
@@ -122,6 +130,14 @@ async def _pg_get_pending_requests(status: str, session: AsyncSession) -> list[d
             "resolved_at":     str(row["resolved_at"])    if row["resolved_at"]    else None,
             "resolved_by":     row["resolved_by"],
             "resolution_note": row["resolution_note"],
+            "requested_address": row["requested_address"],
+            "requested_city":    row["requested_city"],
+            "requested_state":   row["requested_state"],
+            "requested_pincode": row["requested_pincode"],
+            "current_address":   row["current_address"],
+            "current_city":      row["current_city"],
+            "current_state":     row["current_state"],
+            "current_pincode":   row["current_pincode"],
             "order": {
                 "status":           row["order_status"],
                 "current_delivery": str(row["order_estimated_delivery_date"]) if row["order_estimated_delivery_date"] else None,
@@ -134,7 +150,6 @@ async def _pg_get_pending_requests(status: str, session: AsyncSession) -> list[d
             },
         })
     return requests
-
 
 async def _pg_approve_request(
     request_id:    str,
@@ -167,12 +182,15 @@ async def _pg_approve_request(
         {"id": request_id, "resolved_at": now, "resolved_by": admin_email, "note": note}
     )
 
-    # Strip to plain date — the column is DATE, not TIMESTAMPTZ
-    requested_date = req["requested_date"]
-    if isinstance(requested_date, datetime):
-        requested_date = requested_date.date()
+    # ── Branch on request type ────────────────────────────────────────────────
 
-    await session.execute(
+    if req["type"] == "date_change":
+        # Strip to plain date — the column is DATE, not TIMESTAMPTZ
+        requested_date = req["requested_date"]
+        if isinstance(requested_date, datetime):
+            requested_date = requested_date.date()
+
+        await session.execute(
             text("""
                 UPDATE orders
                 SET order_estimated_delivery_date = :requested_date
@@ -181,14 +199,47 @@ async def _pg_approve_request(
             {"requested_date": requested_date, "order_id": req["order_id"]}
         )
 
-    await session.commit()
+        approval_message = (
+            f"Great news! Your delivery date change request has been approved. "
+            f"Your new delivery date is {_format_date(req['requested_date'])}."
+        )
 
-    # FIX: req["requested_date"] from a DATE column is a plain datetime.date,
-    # not a datetime. Using _format_date() handles both types safely.
-    approval_message = (
-        f"Great news! Your delivery date change request has been approved. "
-        f"Your new delivery date is {_format_date(req['requested_date'])}."
-    )
+    elif req["type"] == "address_change":
+        new_address = (
+            f"{req['requested_address']}, {req['requested_city']}, "
+            f"{req['requested_state']} - {req['requested_pincode']}"
+        )
+
+        await session.execute(
+            text("""
+                UPDATE orders
+                SET delivery_full_address = :full_address,
+                    delivery_city         = :city,
+                    delivery_state        = :state,
+                    delivery_pincode      = :pincode
+                WHERE order_id = :order_id
+            """),
+            {
+                "full_address": req["requested_address"],
+                "city":         req["requested_city"],
+                "state":        req["requested_state"],
+                "pincode":      req["requested_pincode"],
+                "order_id":     req["order_id"],
+            }
+        )
+
+        approval_message = (
+            f"Great news! Your delivery address change request has been approved. "
+            f"Your new delivery address is {new_address}."
+        )
+
+    else:
+        # Fallback for any future request types
+        approval_message = "Your request has been approved."
+
+    # ── Commit + notify (same for all types) ─────────────────────────────────
+
+    await session.commit()
 
     session_id = req["session_id"] or ""
     if session_id:
@@ -208,7 +259,6 @@ async def _pg_approve_request(
     )
 
     return {"status": "approved", "request_id": request_id, "note": note}
-
 
 async def _pg_reject_request(
     request_id:    str,
@@ -242,7 +292,13 @@ async def _pg_reject_request(
     )
     await session.commit()
 
-    rejection_message = (
+    if req["type"] == "address_change":
+        rejection_message = (
+        "Unfortunately your delivery address change request could not be approved. "
+        f"Reason: {note or 'No reason provided'}."
+    )
+    else:
+        rejection_message = (
         "Unfortunately your delivery date change request could not be approved. "
         f"Reason: {note or 'No reason provided'}."
     )
@@ -480,4 +536,3 @@ async def reject_request(
         await conversations.append_notification(session_id=session_id, message=rejection_message, status="rejected")
     await ws_manager.notify_session(session_id=session_id, payload={"type": "request_resolved", "status": "rejected", "message": rejection_message})
     return {"status": "rejected", "request_id": request_id, "note": body.note}
-
