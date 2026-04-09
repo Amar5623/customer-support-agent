@@ -16,6 +16,8 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
   // Detect request type
   const isDateChange = request.type === "date_change"
   const isReturn     = request.type === "return_request"
+  const isAddressChange = request.type === "address_change"
+  const isMissingItem   = request.type === "missing_item"
   const isCancellation  = request.type === "cancellation_request" 
 
   // Existing variables for date change (kept unchanged)
@@ -53,9 +55,11 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
         {/* Header */}
         <div style={styles.header}>
           <div>
-             <p style={styles.headerEyebrow}>
-              {isDateChange   ? "Delivery date change" :
-               isReturn       ? "Return Request"       :
+            <p style={styles.headerEyebrow}>
+              {isDateChange    ? "Delivery Date Change"  :
+               isAddressChange ? "Address Change"        :
+               isReturn        ? "Return Request"        :
+               isMissingItem   ? "Missing Item Report"   :
                isCancellation ? "Order Cancellation"   : "Request"}
             </p>
             <h3 style={styles.headerTitle}>
@@ -89,6 +93,63 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
               <Row label="Requested date" value={
                 <span className="mono" style={{ ...styles.dateMono, color: 'var(--blue-text)' }}>
                   {formatDate(requestedDate)}
+                </span>
+              } />
+              <Row label="Submitted" value={
+                <span className="mono" style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                  {formatDateTime(request.created_at)}
+                </span>
+              } />
+              <Row label="Status" value={
+                <span className={`badge badge-${request.status}`}>{request.status}</span>
+              } />
+            </Section>
+          )}
+
+          {/* ADDRESS CHANGE SECTION */}
+          {isAddressChange && (
+            <Section title="Address Change Details">
+              <Row label="Current Address" value={
+                <span style={{ fontSize: '11.5px', color: 'var(--text-secondary)', textAlign: 'right', lineHeight: 1.5 }}>
+                  {[request.current_address, request.current_city, request.current_state, request.current_pincode]
+                    .filter(Boolean).join(', ') || '—'}
+                </span>
+              } />
+              <Row label="Requested Address" value={
+                <span style={{ fontSize: '11.5px', color: 'var(--blue-text)', textAlign: 'right', lineHeight: 1.5 }}>
+                  {[request.requested_address, request.requested_city, request.requested_state, request.requested_pincode]
+                    .filter(Boolean).join(', ') || '—'}
+                </span>
+              } />
+              <Row label="Submitted" value={
+                <span className="mono" style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                  {formatDateTime(request.created_at)}
+                </span>
+              } />
+              <Row label="Status" value={
+                <span className={`badge badge-${request.status}`}>{request.status}</span>
+              } />
+            </Section>
+          )}
+
+          {/* MISSING ITEM SECTION */}
+          {isMissingItem && (
+            <Section title="Missing Item Details">
+              <Row label="Missing Items" value={
+                Array.isArray(request.reported_items) && request.reported_items.length > 0
+                  ? request.reported_items.join(', ')
+                  : '—'
+              } />
+              <Row label="Package Condition" value={
+                <span style={{
+                  fontSize: '12px',
+                  fontWeight: '600',
+                  textTransform: 'capitalize',
+                  color: request.package_condition === 'intact'
+                    ? 'var(--text-primary)'
+                    : 'var(--red-text)',
+                }}>
+                  {request.package_condition || '—'}
                 </span>
               } />
               <Row label="Submitted" value={

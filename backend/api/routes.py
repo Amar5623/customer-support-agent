@@ -117,7 +117,7 @@ async def chat(
         tc.tool_name in (
             "change_delivery_date",
             "change_delivery_address",
-            "initiate_return",
+            "initiate_return","report_missing_item",
             "cancel_order",          # ← NEW
         )
         for tc in response.tool_calls
@@ -135,7 +135,7 @@ async def chat(
                             WHERE user_id    = :user_id
                             AND status     = 'pending'
                             AND session_id IS NULL
-                            AND type       IN ('date_change', 'address_change', 'return_request', 'cancellation_request')
+                            AND type       IN ('date_change', 'address_change', 'return_request','missing_item', 'cancellation_request')
                             ORDER BY created_at DESC
                             LIMIT 1
                         )

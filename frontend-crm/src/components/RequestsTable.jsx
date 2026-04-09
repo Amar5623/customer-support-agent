@@ -105,8 +105,10 @@ function RequestRow({ req, selected, animatingOut, onClick }) {
 
   // NEW: Determine request type (added without removing anything)
   let requestType = "Unknown"
-  if (req.type === "date_change") requestType = "Delivery Date Change"
+  if (req.type === "date_change")    requestType = "Delivery Date Change"
+  if (req.type === "address_change") requestType = "Address Change"
   if (req.type === "return_request") requestType = "Return Request"
+  if (req.type === "missing_item")   requestType = "Missing Item Report"  
   if (req.type === "cancellation_request")  requestType = "Order Cancellation"  
   // Build row style without conflicting shorthand/longhand
   const rowStyle = {

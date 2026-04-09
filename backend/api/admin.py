@@ -87,6 +87,10 @@ async def _pg_get_pending_requests(status: str, session: AsyncSession) -> list[d
                 pr.items,
                 pr.refund_method,
                 pr.return_shipping_covered_by,
+                pr.reported_items,
+                pr.received_items,
+                pr.package_condition,
+                pr.resolution_type,
 
                 o.order_status,
                 o.order_estimated_delivery_date,
@@ -143,6 +147,10 @@ async def _pg_get_pending_requests(status: str, session: AsyncSession) -> list[d
             "current_city":      row["current_city"],
             "current_state":     row["current_state"],
             "current_pincode":   row["current_pincode"],
+            "reported_items":   json.loads(row["reported_items"]) if row["reported_items"] else [],
+            "received_items":   json.loads(row["received_items"])  if row["received_items"]  else [],
+            "package_condition": row["package_condition"],
+            "resolution_type":   row["resolution_type"],
             "reason":                      row["reason"],
             "items":                       json.loads(row["items"]) if row["items"] else [],
             "refund_method":               row["refund_method"],
@@ -258,6 +266,16 @@ async def _pg_approve_request(
             f"Your refund via {req['refund_method'].replace('_', ' ')} "
             f"will be processed within 5–7 business days of receiving the return."
         )
+    
+    elif req["type"] == "missing_item":
+        items     = json.loads(req["reported_items"]) if req["reported_items"] else []
+        items_str = ", ".join(items) if items else "the reported item(s)"
+
+        approval_message = (
+            f"Good news! We have investigated your missing item report. "
+            f"We will reship {items_str} to you within 3–5 business days. "
+            f"You will receive a shipping confirmation once dispatched."
+        )
     elif req["type"] == "cancellation_request":
         # Flip order status to 'Cancelled'.
         # We normalise the existing value first so both 'cancelled' and
@@ -350,6 +368,13 @@ async def _pg_reject_request(
         f"Reason: {note or 'No reason provided'}. "
         "If you have further questions please contact our support team."
     )
+    elif req["type"] == "missing_item":
+        rejection_message = (
+            "We have investigated your missing item report and were unable to verify "
+            "the claim at this time. "
+            f"Reason: {note or 'No reason provided'}. "
+            "Please contact our support team if you have further questions."
+        )
     elif req["type"] == "cancellation_request":
         rejection_message = (
             "Unfortunately your cancellation request could not be approved. "
