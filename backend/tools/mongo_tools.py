@@ -1576,6 +1576,147 @@ class ChangeOrderItem(BaseTool):
             "new_color": check_color,
         })
 
+# ── 12. Cancel Order Tool ─────────────────────────────────────────────────────
+class CancelOrder(BaseTool):
+    def __init__(self, db: AsyncIOMotorDatabase):
+        self._db = db
+
+    @property
+    def name(self) -> str:
+        return "cancel_order"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Cancel a customer's order following Leafy's official Cancellation Policy. "
+            "Cancellation is **ONLY allowed** when the order status is 'Processing' or 'In process'. "
+            "If the order is Shipped, In Transit, Out for Delivery, Delivered, or already Cancelled, "
+            "cancellation is not possible — the tool will reject it and explain why. "
+            "On successful cancellation, a full refund including original shipping cost will be issued "
+            "to the original payment method (3–5 business days) or as store credit (instant). "
+            
+            "Important instructions for the agent:\n"
+            "- If the customer says 'cancel my order' without specifying which one, "
+            "first call get_order_history to list their recent orders, then ask which one they want to cancel.\n"
+            "- Always confirm the correct order with the customer before calling this tool.\n"
+            "- You may ask for a reason, but it is optional."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "The confirmed order ID to cancel"
+                },
+                "email": {
+                    "type": "string",
+                    "description": "Customer email for verification"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason provided by customer (e.g. 'changed mind', 'found better price')"
+                }
+            },
+            "required": ["order_id", "email"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        order_id = kwargs.get("order_id", "").strip()
+        email    = kwargs.get("email", "").strip().lower()
+        reason   = kwargs.get("reason", "").strip()
+
+        if not order_id or not email:
+            return self.error("order_id and email are required.")
+
+        try:
+            oid = ObjectId(order_id)
+        except Exception:
+            return self.error(f"'{order_id}' is not a valid order ID.")
+
+        # Get user
+        user = await self._db.users.find_one(
+            {"email": {"$regex": f"^{email}$", "$options": "i"}},
+            {"_id": 1, "name": 1, "surname": 1}
+        )
+        if not user:
+            return self.error(f"No account found for email: {email}")
+
+        # Get order
+        order = await self._db.orders.find_one({"_id": oid})
+        if not order:
+            return self.error(f"No order found with ID {order_id}.")
+
+        if str(order.get("userId")) != str(user["_id"]):
+            return self.error("This order does not belong to the provided customer.")
+
+        status = order.get("status", "")
+
+        # Policy Check: Only Processing orders can be cancelled
+        if status not in ["Processing", "In process"]:
+            return self.success({
+                "outcome": "rejected",
+                "reason": (
+                    f"Your order is currently '{status}'. "
+                    "According to our policy, orders can only be cancelled while they are still in 'Processing' status. "
+                    "If the order has already shipped, please wait for delivery and initiate a return instead."
+                ),
+                "current_status": status
+            })
+
+        # Check if already cancelled
+        if status == "Cancelled":
+            return self.success({
+                "outcome": "already_cancelled",
+                "reason": "This order has already been cancelled."
+            })
+
+        now = datetime.now(timezone.utc)
+
+        # Perform cancellation
+        await self._db.orders.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "status": "Cancelled",
+                    "cancelled_at": now,
+                    "cancellation_reason": reason or "Customer requested cancellation",
+                    "refund_status": "Pending"
+                },
+                "$push": {
+                    "status_history": {
+                        "status": "Cancelled",
+                        "timestamp": now,
+                        "note": f"Cancelled by customer request. Reason: {reason or 'Not specified'}",
+                        "updated_by": "system"
+                    }
+                }
+            }
+        )
+
+        # Optional: Create a simple cancellation record (for audit)
+        await self._db.cancellations.insert_one({
+            "order_id": oid,
+            "user_id": user["_id"],
+            "reason": reason or "Customer requested",
+            "cancelled_at": now,
+            "refund_amount": order.get("total_amount", 0),   # you may need to calculate this properly
+            "refund_method": "original_payment"
+        })
+
+        return self.success({
+            "outcome": "success",
+            "message": (
+                "Your order has been successfully cancelled. "
+                "A full refund including original shipping cost will be issued to your original payment method "
+                "within 3–5 business days."
+            ),
+            "order_id": order_id,
+            "refund_timeline": "3–5 business days"
+        })
+
 # ── Registry ────────────────────────────────────────────────────────────────────
 
 def get_all_tools(db: AsyncIOMotorDatabase) -> list[BaseTool]:
@@ -1592,4 +1733,5 @@ def get_all_tools(db: AsyncIOMotorDatabase) -> list[BaseTool]:
         GetTotalAmountPaid(db),
         InitiateReturn(db),
         ChangeOrderItem(db),
+        CancelOrder(db),
     ]
