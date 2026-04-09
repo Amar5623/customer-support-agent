@@ -1165,6 +1165,7 @@ class GetSellerInfoPG(BaseTool):
         except Exception as e:
             logger.exception(f"get_seller_info failed for email={email}, order_id={order_id}")
             return self.error(f"Failed to retrieve seller info: {str(e)}") 
+        
 class GetUserProfilePG(BaseTool):
     def __init__(self, session_factory):
         self._session_factory = session_factory
@@ -1248,6 +1249,189 @@ class GetUserProfilePG(BaseTool):
         except Exception as e:
             logger.exception(f"get_user_profile failed for email={email}")
             return self.error(f"Failed to retrieve profile: {str(e)}")
+        
+# ── Update User Profile ──────────────────────────────────────────────────────
+
+class UpdateUserProfilePG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    @property
+    def name(self) -> str:
+        return "update_user_profile"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Update a customer's profile details — name, phone, or address. "
+            "Only update fields the customer explicitly asks to change. "
+            "Never update email, password, loyalty tier, or account status. "
+            "Call get_user_profile first if you need to show current values."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email":    {"type": "string", "description": "Customer email (to identify account)"},
+                "name":     {"type": "string", "description": "New first name"},
+                "surname":  {"type": "string", "description": "New last name"},
+                "phone":    {"type": "string", "description": "New phone number"},
+                "address":  {"type": "string", "description": "New full street address"},
+                "city":     {"type": "string", "description": "New city"},
+                "state":    {"type": "string", "description": "New state"},
+                "pincode":  {"type": "string", "description": "New pincode"},
+            },
+            "required": ["email"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        email   = kwargs.get("email", "").strip().lower()
+        name    = kwargs.get("name",    "").strip()
+        surname = kwargs.get("surname", "").strip()
+        phone   = kwargs.get("phone",   "").strip()
+        address = kwargs.get("address", "").strip()
+        city    = kwargs.get("city",    "").strip()
+        state   = kwargs.get("state",   "").strip()
+        pincode = kwargs.get("pincode", "").strip()
+
+        if not email:
+            return self.error("email is required.")
+
+        # Must have at least one field to update
+        user_fields     = {k: v for k, v in {"name": name, "surname": surname}.items() if v}
+        customer_fields = {k: v for k, v in {
+            "phone":           phone,
+            "full_address":    address,
+            "customer_city":   city,
+            "customer_state":  state,
+            "pincode":         pincode,
+        }.items() if v}
+
+        if not user_fields and not customer_fields:
+            return self.error(
+                "No fields to update — please specify at least one field to change."
+            )
+
+        try:
+            async with self._session_factory() as session:
+
+                # ── 1. Verify user exists ────────────────────────────────────
+                user_result = await session.execute(
+                    text("SELECT id FROM users WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+                active_orders = []
+                # ── 2. Update users table if needed ──────────────────────────
+                if user_fields:
+                    set_clause = ", ".join(f"{k} = :{k}" for k in user_fields)
+                    await session.execute(
+                        text(f"UPDATE users SET {set_clause} WHERE LOWER(email) = :email"),
+                        {**user_fields, "email": email}
+                    )
+
+                # ── 3. Update customers table if needed ──────────────────────
+                if customer_fields and any(k in customer_fields for k in 
+                    ("full_address", "customer_city", "customer_state", "pincode")):
+
+                    # Find active orders that haven't had delivery address set yet
+                    active_orders_result = await session.execute(
+                        text("""
+                            SELECT o.order_id
+                            FROM orders o
+                            JOIN customers c ON c.customer_id = o.customer_id
+                            WHERE LOWER(c.email) = :email
+                            AND o.order_status NOT IN ('delivered', 'cancelled')
+                            AND o.delivery_full_address IS NULL
+                        """),
+                        {"email": email}
+                    )
+                    active_orders = active_orders_result.mappings().all()
+
+                    if active_orders:
+                        # Fetch current address from customers before overwriting
+                        current_result = await session.execute(
+                            text("""
+                                SELECT full_address, customer_city, customer_state, pincode
+                                FROM customers
+                                WHERE LOWER(email) = :email
+                            """),
+                            {"email": email}
+                        )
+                        current = current_result.mappings().first()
+
+                        if current:
+                            order_ids = [o["order_id"] for o in active_orders]
+                            for order_id in order_ids:
+                                await session.execute(
+                                    text("""
+                                        UPDATE orders
+                                        SET delivery_full_address = :full_address,
+                                            delivery_city         = :city,
+                                            delivery_state        = :state,
+                                            delivery_pincode      = :pincode
+                                        WHERE order_id = :order_id
+                                    """),
+                                    {
+                                        "full_address": current["full_address"],
+                                        "city":         current["customer_city"],
+                                        "state":        current["customer_state"],
+                                        "pincode":      current["pincode"],
+                                        "order_id":     order_id,
+                                    }
+                                )
+
+                # ── 4. Now safe to update customers table ────────────────────────────
+                if customer_fields:
+                    set_clause = ", ".join(f"{k} = :{k}" for k in customer_fields)
+                    await session.execute(
+                        text(f"UPDATE customers SET {set_clause} WHERE LOWER(email) = :email"),
+                        {**customer_fields, "email": email}
+                    )
+
+                # ── 5. Update users table if needed ──────────────────────────
+                if user_fields:
+                    set_clause = ", ".join(f"{k} = :{k}" for k in user_fields)
+                    await session.execute(
+                        text(f"UPDATE users SET {set_clause} WHERE LOWER(email) = :email"),
+                        {**user_fields, "email": email}
+                    )
+
+                await session.commit()
+
+                # ── 6. Build summary ──────────────────────────────────────────
+                changed = []
+                if name:    changed.append(f"first name to '{name}'")
+                if surname: changed.append(f"last name to '{surname}'")
+                if phone:   changed.append(f"phone to '{phone}'")
+                if address: changed.append(f"address to '{address}'")
+                if city:    changed.append(f"city to '{city}'")
+                if state:   changed.append(f"state to '{state}'")
+                if pincode: changed.append(f"pincode to '{pincode}'")
+
+                snapshot_note = ""
+                if active_orders and any(k in customer_fields for k in
+                    ("full_address", "customer_city", "customer_state", "pincode")):
+                    snapshot_note = (
+                        f" Your {len(active_orders)} active order(s) will continue "
+                        f"to ship to your previous address. Use 'change delivery address' "
+                        f"per order if you want to redirect them."
+                    )
+
+                return self.success({
+                    "outcome":        "updated",
+                    "message":        f"Profile updated successfully: {', '.join(changed)}.{snapshot_note}",
+                    "updated_fields": list(user_fields.keys()) + list(customer_fields.keys()),
+                    "active_orders_snapshotted": len(active_orders) if active_orders else 0,
+                })
+
+        except Exception as e:
+            logger.exception(f"update_user_profile failed for {email}")
+            return self.error(f"Failed to update profile: {str(e)}")
         
 # ── 6. Initiate Return ───────────────────────────────────────────────────────
 
@@ -1514,6 +1698,391 @@ class InitiateReturnPG(BaseTool):
             logger.exception(f"initiate_return failed for {order_id}")
             return self.error(f"Failed to process return request: {str(e)}")
 
+class ReportMissingItemPG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    @property
+    def name(self) -> str:
+        return "report_missing_item"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Report one or more missing items from a delivered order. "
+            "DO NOT use for wrong items received — use report_wrong_item for that. "
+            "Order must be 'delivered' to use this tool. "
+            "Before calling, confirm: which items are missing and package condition. "
+            "If customer hasn't specified order, call get_order_history first. "
+            "Always call get_order_details first to confirm which items exist in the order."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email":             {"type": "string",  "description": "Customer email"},
+                "order_id":          {"type": "string",  "description": "Order ID confirmed by customer"},
+                "missing_items":     {
+                    "type":  "array",
+                    "items": {"type": "string"},
+                    "description": "Names of missing items exactly as they appear in the order"
+                },
+                "package_condition": {
+                    "type": "string",
+                    "enum": ["intact", "damaged", "tampered"],
+                    "description": "Condition of the package when it arrived"
+                },
+            },
+            "required": ["email", "order_id", "missing_items", "package_condition"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        email             = kwargs.get("email", "").strip().lower()
+        order_id          = kwargs.get("order_id", "").strip()
+        missing_items     = kwargs.get("missing_items", [])
+        package_condition = kwargs.get("package_condition", "").strip()
+
+        # ── Input validation ─────────────────────────────────────────────────
+        if not email:
+            return self.error("email is required.")
+        if not order_id:
+            return self.error("order_id is required.")
+        if not missing_items:
+            return self.error("At least one missing item must be specified.")
+        if not package_condition:
+            return self.error("package_condition is required.")
+
+        try:
+            async with self._session_factory() as session:
+
+                # ── 1. Verify user ───────────────────────────────────────────
+                user_result = await session.execute(
+                    text("SELECT id FROM users WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+
+                # ── 2. Verify order ownership ────────────────────────────────
+                customer_result = await session.execute(
+                    text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                customer = customer_result.mappings().first()
+                if not customer:
+                    return self.error("No order history found for this account.")
+
+                order_result = await session.execute(
+                    text("""
+                        SELECT
+                            o.order_id,
+                            o.order_status,
+                            STRING_AGG(p.product_name, ', ') AS products
+                        FROM orders o
+                        LEFT JOIN order_items oi ON oi.order_id   = o.order_id
+                        LEFT JOIN products    p  ON p.product_id  = oi.product_id
+                        WHERE o.order_id    = :order_id
+                          AND o.customer_id = :customer_id
+                        GROUP BY o.order_id, o.order_status
+                    """),
+                    {"order_id": order_id, "customer_id": customer["customer_id"]}
+                )
+                order = order_result.mappings().first()
+                if not order:
+                    return self.error(f"No order found with ID {order_id}.")
+
+                # ── 3. Must be delivered ─────────────────────────────────────
+                status = order["order_status"]
+                if status != "delivered":
+                    return self.success({
+                        "outcome": "rejected",
+                        "reason": (
+                            f"Your order is currently '{status}'. "
+                            "Missing item reports can only be made after "
+                            "the order has been delivered."
+                        ),
+                        "current_status": status,
+                    })
+
+                # ── 4. Validate missing items exist in the order ─────────────
+                order_products = [
+                    p.strip().lower()
+                    for p in (order["products"] or "").split(",")
+                ]
+                invalid_items = [
+                    item for item in missing_items
+                    if item.strip().lower() not in order_products
+                ]
+                if invalid_items:
+                    return self.success({
+                        "outcome": "invalid_items",
+                        "reason": (
+                            f"The following items were not found in this order: "
+                            f"{', '.join(invalid_items)}. "
+                            f"Order contains: {order['products']}."
+                        ),
+                        "invalid_items":  invalid_items,
+                        "order_products": order["products"],
+                    })
+
+                # ── 5. Check for existing pending report ─────────────────────
+                existing_result = await session.execute(
+                    text("""
+                        SELECT id FROM pending_requests
+                        WHERE order_id = :order_id
+                          AND type     = 'missing_item'
+                          AND status   = 'pending'
+                        LIMIT 1
+                    """),
+                    {"order_id": order_id}
+                )
+                existing = existing_result.mappings().first()
+                if existing:
+                    return self.success({
+                        "outcome":    "already_pending",
+                        "reason":     (
+                            "There is already a pending missing item report for this order. "
+                            "Our team is investigating and will respond within 24 hours."
+                        ),
+                        "request_id": existing["id"],
+                    })
+
+                # ── 6. Determine resolution type hint for admin ──────────────
+                # Give admin a starting point based on package condition
+                resolution_hint = {
+                    "intact":   "investigate",  # warehouse error likely
+                    "damaged":  "investigate",  # carrier damage, file claim
+                    "tampered": "investigate",  # theft likely, escalate
+                }.get(package_condition, "investigate")
+
+                # ── 7. Insert pending request ────────────────────────────────
+                request_id = str(uuid.uuid4())
+                now        = datetime.now(timezone.utc)
+
+                await session.execute(
+                    text("""
+                        INSERT INTO pending_requests (
+                            id, type, status, order_id, user_id,
+                            reported_items, package_condition,
+                            resolution_type, session_id, created_at
+                        ) VALUES (
+                            :id, :type, :status, :order_id, :user_id,
+                            :reported_items, :package_condition,
+                            :resolution_type, NULL, :created_at
+                        )
+                    """),
+                    {
+                        "id":               request_id,
+                        "type":             "missing_item",
+                        "status":           "pending",
+                        "order_id":         order_id,
+                        "user_id":          user["id"],
+                        "reported_items":   json.dumps(missing_items),
+                        "package_condition": package_condition,
+                        "resolution_type":  resolution_hint,
+                        "created_at":       now,
+                    }
+                )
+                await session.commit()
+
+                # ── 8. Broadcast to admin CRM ────────────────────────────────
+                try:
+                    from backend.api.websocket import ws_manager
+                    await ws_manager.broadcast_to_admins({
+                        "type":         "new_request",
+                        "request_id":   request_id,
+                        "order_id":     order_id,
+                        "request_type": "missing_item",
+                    })
+                except Exception as broadcast_err:
+                    logger.warning(f"Admin broadcast failed: {broadcast_err}")
+
+                # ── 9. Build customer message based on package condition ──────
+                condition_context = {
+                    "intact":   (
+                        "This appears to be a warehouse packing error. "
+                        "Our team will investigate and reship the missing item(s) "
+                        "or process a refund if unavailable."
+                    ),
+                    "damaged":  (
+                        "Since your package arrived damaged, this may be a carrier issue. "
+                        "Our team will file a claim and arrange a replacement or refund."
+                    ),
+                    "tampered": (
+                        "Since your package arrived tampered, we are treating this as urgent. "
+                        "Our team will escalate this immediately."
+                    ),
+                }.get(package_condition, "Our team will investigate.")
+
+                return self.success({
+                    "outcome":    "pending_approval",
+                    "request_id": request_id,
+                    "message": (
+                        f"Your missing item report has been submitted. "
+                        f"{condition_context} "
+                        f"We will update you within 24 hours."
+                    ),
+                    "missing_items":     missing_items,
+                    "package_condition": package_condition,
+                    "order_id":          order_id,
+                })
+
+        except Exception as e:
+            logger.exception(f"report_missing_item failed for {order_id}")
+            return self.error(f"Failed to submit missing item report: {str(e)}")
+
+class GetRequestStatusPG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    @property
+    def name(self) -> str:
+        return "get_request_status"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Get the status of any pending or resolved requests for a customer. "
+            "Use when customer asks about their return, cancellation, date change, "
+            "address change, or missing item report status. "
+            "Returns all requests — filter by type if customer specifies one."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email": {"type": "string", "description": "Customer email"},
+                "type":  {
+                    "type": "string",
+                    "enum": [
+                        "return_request",
+                        "cancel_request",
+                        "date_change",
+                        "address_change",
+                        "missing_item",
+                    ],
+                    "description": "Optional — filter by request type if customer specifies"
+                },
+            },
+            "required": ["email"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        email        = kwargs.get("email", "").strip().lower()
+        filter_type  = kwargs.get("type", "").strip()
+
+        if not email:
+            return self.error("email is required.")
+
+        try:
+            async with self._session_factory() as session:
+
+                # ── 1. Verify user ───────────────────────────────────────────
+                user_result = await session.execute(
+                    text("SELECT id FROM users WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+
+                # ── 2. Build query ───────────────────────────────────────────
+                query = """
+                    SELECT
+                        id,
+                        type,
+                        status,
+                        order_id,
+                        created_at,
+                        resolved_at,
+                        resolution_note,
+                        requested_date,
+                        requested_address,
+                        requested_city,
+                        requested_state,
+                        requested_pincode,
+                        reason,
+                        items,
+                        refund_method,
+                        return_shipping_covered_by,
+                        reported_items,
+                        package_condition
+                    FROM pending_requests
+                    WHERE user_id = :user_id
+                """
+                params = {"user_id": user["id"]}
+
+                if filter_type:
+                    query += " AND type = :type"
+                    params["type"] = filter_type
+
+                query += " ORDER BY created_at DESC LIMIT 10"
+
+                result = await session.execute(text(query), params)
+                rows   = result.mappings().all()
+
+                if not rows:
+                    msg = (
+                        f"No {filter_type.replace('_', ' ')} requests found."
+                        if filter_type
+                        else "No requests found for this account."
+                    )
+                    return self.success({
+                        "outcome":  "no_requests",
+                        "message":  msg,
+                        "requests": [],
+                    })
+
+                # ── 3. Serialize ─────────────────────────────────────────────
+                requests = []
+                for row in rows:
+                    entry = {
+                        "request_id":   row["id"],
+                        "type":         row["type"],
+                        "status":       row["status"],
+                        "order_id":     row["order_id"],
+                        "created_at":   str(row["created_at"]) if row["created_at"] else None,
+                        "resolved_at":  str(row["resolved_at"]) if row["resolved_at"] else None,
+                        "resolution_note": row["resolution_note"],
+                    }
+
+                    # Type-specific fields
+                    if row["type"] == "date_change":
+                        entry["requested_date"] = str(row["requested_date"]) if row["requested_date"] else None
+
+                    elif row["type"] == "address_change":
+                        entry["requested_address"] = row["requested_address"]
+                        entry["requested_city"]    = row["requested_city"]
+                        entry["requested_state"]   = row["requested_state"]
+                        entry["requested_pincode"] = row["requested_pincode"]
+
+                    elif row["type"] == "return_request":
+                        entry["reason"]                      = row["reason"]
+                        entry["items"]                       = json.loads(row["items"]) if row["items"] else []
+                        entry["refund_method"]               = row["refund_method"]
+                        entry["return_shipping_covered_by"]  = row["return_shipping_covered_by"]
+
+                    elif row["type"] == "missing_item":
+                        entry["reported_items"]    = json.loads(row["reported_items"]) if row["reported_items"] else []
+                        entry["package_condition"] = row["package_condition"]
+
+                    requests.append(entry)
+
+                return self.success({
+                    "outcome":  "found",
+                    "requests": requests,
+                    "total":    len(requests),
+                })
+
+        except Exception as e:
+            logger.exception(f"get_request_status failed for {email}")
+            return self.error(f"Failed to fetch request status: {str(e)}")
+
 def get_all_pg_tools(session_factory) -> list[BaseTool]:
     return [
         ThinkTool(),  # always include the ThinkTool for better agent reasoning
@@ -1524,6 +2093,9 @@ def get_all_pg_tools(session_factory) -> list[BaseTool]:
         ChangeDeliveryAddressPG(session_factory),
         GetPaymentInfoPG(session_factory),
         GetSellerInfoPG(session_factory),
-        GetUserProfilePG(session_factory), 
+        GetUserProfilePG(session_factory),
+        UpdateUserProfilePG(session_factory),
         InitiateReturnPG(session_factory),
+        ReportMissingItemPG(session_factory),
+        GetRequestStatusPG(session_factory),
     ]   
