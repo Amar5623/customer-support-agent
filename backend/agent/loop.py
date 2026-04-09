@@ -293,11 +293,13 @@ async def run_agent(
             header = "[" + " | ".join(identity_parts) + "]"
             user_content = f"{header}\n{request.message}"
     else:
+        if request.user_email:
+            identity_parts.append(f"Customer email: {request.user_email}")
         if request.order_id:
-            user_content = (
-                f"[Confirmed order ID: {request.order_id}]\n"
-                f"{request.message}"
-            )
+            identity_parts.append(f"Confirmed order ID: {request.order_id}")
+        if identity_parts:
+            header = "[" + " | ".join(identity_parts) + "]"
+            user_content = f"{header}\n{request.message}"
 
     messages.append(Message(role=Role.user, content=user_content))
 

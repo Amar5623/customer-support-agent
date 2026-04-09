@@ -111,7 +111,7 @@ export function useRequests(tab = 'pending') {
 
     // Wait for CSS animation, then remove from list and refresh stats
     setTimeout(async () => {
-      setRequests(prev => prev.filter(r => r._id !== id))
+      setRequests(prev => prev.filter(r => r.id !== id))
       setAnimatingOut(prev => { const s = new Set(prev); s.delete(id); return s })
       try {
         const st = await fetchStats()

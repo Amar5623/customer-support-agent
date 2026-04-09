@@ -1444,6 +1444,7 @@ class InitiateReturnPG(BaseTool):
                     logger.warning(f"Admin broadcast failed: {broadcast_err}")
 
                 return self.success({
+                    "email":      email,
                     "outcome":    "pending_approval",
                     "request_id": request_id,
                     "message": (
@@ -1645,7 +1646,7 @@ class CancelOrderPG(BaseTool):
                                 order_id,
                                 user_id,
                                 requested_date,
-                                current_date,
+                                "current_date",
                                 session_id,
                                 reason,
                                 refund_method,
@@ -1692,6 +1693,7 @@ class CancelOrderPG(BaseTool):
                         logger.warning(f"Admin broadcast failed: {broadcast_err}")
 
                     return self.success({
+                        "email":      email,
                         "outcome":    "request_submitted",
                         "order_id":   order_id,
                         "request_id": request_id,
