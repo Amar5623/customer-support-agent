@@ -20,6 +20,73 @@ settings = get_settings()
 # with this prefix so the LLM can replay its own reasoning on the next turn.
 _TOOL_CALLS_MARKER = "__tool_calls__:"
 
+# ── Tool result slimmer ───────────────────────────────────────────────────────
+# Full Mongo documents can be 500+ tokens. We strip fields the LLM never needs
+# so history re-plays are cheap. Only applied before DB storage — the live
+# in-request result that the LLM sees this turn is always the full response.
+
+_FIELDS_TO_DROP_FROM_ORDERS = {
+    "_seed", "userId", "invoiceId", "_id", "payment_summary",
+}
+_PRODUCT_FIELDS_TO_KEEP = {"name", "price", "amount"}
+
+
+def _slim_tool_result(tool_name: str, content_str: str) -> str:
+    """
+    Strip heavyweight fields from tool results before persisting.
+    Returns the original string if parsing fails or tool is not handled.
+    """
+    try:
+        result = json.loads(content_str)
+        if not result.get("success"):
+            return content_str  # keep error messages intact
+
+        data = result.get("data", {})
+
+        if tool_name == "get_order_details" and isinstance(data, dict):
+            # Drop internal DB fields
+            for f in _FIELDS_TO_DROP_FROM_ORDERS:
+                data.pop(f, None)
+            # Slim products — keep only name, price, amount
+            if "products" in data:
+                data["products"] = [
+                    {k: v for k, v in p.items() if k in _PRODUCT_FIELDS_TO_KEEP}
+                    for p in data["products"]
+                ]
+            # Drop verbose status_history (we keep current status field)
+            data.pop("status_history", None)
+            # Drop internal request details — keep outcome summary only
+            if "delivery_date_change_request" in data:
+                req = data["delivery_date_change_request"]
+                data["delivery_date_change_request"] = {
+                    "status": req.get("status"),
+                    "requested_date": req.get("requested_date"),
+                }
+            result["data"] = data
+
+        elif tool_name == "get_order_history" and isinstance(data, dict):
+            # Slim each order in the list
+            orders = data.get("orders", [])
+            data["orders"] = [
+                {
+                    "order_id":           o.get("order_id"),
+                    "status":             o.get("status"),
+                    "estimated_delivery": o.get("estimated_delivery"),
+                    "items":              o.get("items", [])[:3],  # max 3 items shown
+                }
+                for o in orders
+            ]
+            result["data"] = data
+
+        elif tool_name == "get_user_profile" and isinstance(data, dict):
+            # Keep only the fields the agent actually uses
+            keep = {"name", "surname", "email", "loyaltyTier", "loyaltyPoints", "accountStatus"}
+            result["data"] = {k: v for k, v in data.items() if k in keep}
+
+        return json.dumps(result)
+
+    except Exception:
+        return content_str  # never crash — return original on any error
 
 class ConversationStore:
     def __init__(self, db=None, session_factory=None):
@@ -139,11 +206,12 @@ class ConversationStore:
             tc_id_to_name = {tc.id: tc.tool_name for tc in tool_calls}
 
             for tr in tool_results:
+                tool_nm = tc_id_to_name.get(tr.tool_call_id, "unknown")
                 messages_to_add.append({
                     "role":         "tool",
-                    "content":      tr.content,
+                    "content":      _slim_tool_result(tool_nm, tr.content),
                     "tool_call_id": tr.tool_call_id,
-                    "name":         tc_id_to_name.get(tr.tool_call_id, "unknown"),
+                    "name":         tool_nm,
                     "timestamp":    now,
                 })
 
