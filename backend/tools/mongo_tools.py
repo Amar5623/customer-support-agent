@@ -61,11 +61,8 @@ class ThinkTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Use this tool to reason through a problem before acting. "
-            "Call it BEFORE any data-fetching or mutation tool call to plan your approach. "
-            "Ask yourself: What does the customer want? Do I already have the data in history? "
-            "Which tool gets it? Do I have all required arguments confirmed? "
-            "This tool has no side effects — it just records your reasoning."
+            "Reason through a problem before acting. Call BEFORE any data-fetching "
+            "or mutation tool. No side effects — just records your reasoning."
         )
 
     @property
@@ -86,11 +83,16 @@ class ThinkTool(BaseTool):
         }
 
     async def execute(self, **kwargs: Any) -> dict:
-        # No-op — the value is in forcing the model to write the reasoning,
-        # not in doing anything with it.
         reasoning = kwargs.get("reasoning", "")
         logger.debug(f"[THINK] {reasoning[:200]}")
-        return {"ok": True}
+        return {
+            "ok": True,
+            "instruction": (
+                "Reasoning recorded. Now act on your plan: "
+                "call the required tool directly. "
+                "Do NOT call think again until you have new data."
+            )
+        }
 
 
 # ── 1. Get Order Details ────────────────────────────────────────────────────────
@@ -106,11 +108,9 @@ class GetOrderDetails(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve FULL details of a SPECIFIC order by its order_id. "
-            "Returns order status, products, shipping address, estimated dates, and status history. "
-            "IMPORTANT: Only call this tool AFTER the customer has confirmed which order they mean. "
-            "If the customer has not specified an order, call get_order_history first to list their "
-            "orders, then ask them to pick one. Never call this with a guessed or assumed order_id."
+            "Get full details for one specific order by order_id: status, products, "
+            "shipping address, estimated dates, and date-change requests. "
+            "Only call AFTER the customer has confirmed which order. Never guess the order_id."
         )
 
     @property
@@ -183,9 +183,8 @@ class GetUserProfile(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve a customer's profile by their email address. "
-            "Returns name, account status, loyalty tier, loyalty points, "
-            "and contact details. Use when the customer asks about their account."
+            "Get a customer's profile by email: name, account status, loyalty tier, "
+            "and points. Use when the customer asks about their account."
         )
 
     @property
@@ -234,15 +233,9 @@ class GetOrderHistory(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve all recent orders for a customer by email. "
-            "Returns a summary list with order_id, status, item names, and dates. "
-            "ALWAYS call this tool FIRST whenever a customer asks about 'my order', "
-            "'where is my package', 'my delivery', or any order-related question "
-            "where they have not specified a particular order. "
-            "After getting results: if there is only 1 order, proceed with it. "
-            "If there are multiple orders, show the customer a plain-language list "
-            "and ask which one they mean — then call get_order_details on the chosen one. "
-            "Active orders (Processing, Shipped, In Transit) should be surfaced first."
+            "List all recent orders for a customer by email: order_id, status, item names, dates. "
+            "Call first whenever a customer asks about 'my order' without specifying which one. "
+            "If multiple orders exist, show the list and ask which one before calling get_order_details."
         )
 
     @property
@@ -347,10 +340,8 @@ class GetReturnStatus(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve the return/refund status for a specific order. "
-            "Returns return status, items being returned, refund amount, and timeline. "
-            "Use when the customer asks about a return or refund. "
-            "If they haven't specified which order, call get_order_history first."
+            "Get the return/refund status for a specific order by order_id. "
+            "Use when the customer asks about a return or refund."
         )
 
     @property
@@ -401,15 +392,10 @@ class ChangeDeliveryDate(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Request a change to the estimated delivery date of an order. "
-            "Automatically approves or creates a pending request based on warehouse schedule. "
-            "Use when the customer asks to change, reschedule, or delay their delivery. "
-            "If the customer hasn't specified which order, call get_order_history first. "
-            "IMPORTANT: If the customer says 'sooner' or gives no specific date, you MUST "
-            "call get_order_details first to read estimated_warehouse_date, then compute "
-            "earliest_possible = estimated_warehouse_date + 1 day, tell the customer that "
-            "exact date, and wait for confirmation before calling this tool. "
-            "Never call this tool with a guessed or invented date."
+            "Request a delivery date change for an order. "
+            "If the customer says 'sooner' or gives no date, call get_order_details first, "
+            "read estimated_warehouse_date, compute earliest = warehouse_date + 1 day, "
+            "tell the customer, and wait for confirmation before calling this."
         )
 
     @property
@@ -592,9 +578,7 @@ class ChangeDeliveryAddress(BaseTool):
     def description(self) -> str:
         return (
             "Change the delivery address on an order. "
-            "Only possible if the order has not yet been shipped. "
-            "Use when the customer wants to update where their order is delivered. "
-            "If the customer hasn't specified which order, call get_order_history first."
+            "Only possible before the order is shipped (status: In process / Ready for delivery)."
         )
 
     @property
@@ -699,12 +683,9 @@ class GetOrderTracking(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Provide complete real-time order tracking details for a specific order. "
-            "Returns current status, estimated dates, products, shipping address, "
-            "any delivery date change requests, invoice summary, and status history. "
-            "Use this tool when the customer asks 'where is my order', 'track my package', "
-            "'order status', 'when will it arrive', or wants full tracking information. "
-            "Always use after confirming the correct order with get_order_history."
+            "Full tracking info for one order: status, estimated dates, products, shipping address, "
+            "date-change requests, and status history. "
+            "Use when the customer asks 'where is my order', 'track my package', or 'when will it arrive'."
         )
 
     @property
@@ -803,13 +784,9 @@ class GetInvoiceDetails(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Retrieve the complete invoice and payment details for **ONE specific order**. "
-            "Returns total amount paid, tax breakdown, due date, invoice number, "
-            "payment transaction details, and loyalty points earned from that order. "
-            "Use this tool when the customer asks about 'my invoice', 'total amount I paid', "
-            "'due date on invoice', 'payment method', or 'tax on my order'. "
-            "This tool returns data for only one order at a time. "
-            "If the customer has multiple orders, first use get_order_history to let them choose one."
+            "Invoice and payment details for one specific order: total paid, tax, due date, "
+            "invoice number, transaction ID, and loyalty points earned. "
+            "Use when the customer asks about their invoice, payment amount, or tax."
         )
 
     @property
@@ -902,12 +879,9 @@ class GetTotalAmountPaid(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Calculate the customer's TOTAL lifetime spending across ALL orders. "
-            "Returns grand total paid, number of orders, average order value, "
-            "highest and lowest order amount, and purchase date range. "
-            "Use this when the customer asks 'how much have I spent in total', "
-            "'what is my total purchase amount', or 'how much money have I paid overall'. "
-            "This tool aggregates data from ALL orders, not just one."
+            "Total lifetime spending across ALL orders: grand total, order count, average, "
+            "highest/lowest order, and date range. "
+            "Use when the customer asks how much they have spent in total."
         )
 
     @property
@@ -1040,15 +1014,9 @@ class InitiateReturn(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Initiate a return request for a delivered order. "
-            "Checks return window eligibility (30 days standard, 45 days for Platinum members), "
-            "validates the order is in 'Delivered' status, and creates a pending return request "
-            "for admin approval. Once approved, the customer receives an RMA number. "
-            "Use when the customer asks to return an item, get a refund, or send something back. "
-            "If the customer hasn't specified which order, call get_order_history first. "
-            "IMPORTANT: Always confirm the return reason and preferred refund method "
-            "(original_payment / store_credit / bank_transfer) from the customer before calling this tool. "
-            "Also confirm which items they want to return if it is a multi-item order."
+            "Initiate a return for a delivered order. Checks 30-day window (45 days for Platinum). "
+            "Requires confirmed order_id, reason, refund method, and item list before calling. "
+            "Use when the customer asks to return an item or get a refund."
         )
  
     @property
