@@ -107,7 +107,7 @@ function RequestRow({ req, selected, animatingOut, onClick }) {
   let requestType = "Unknown"
   if (req.type === "date_change") requestType = "Delivery Date Change"
   if (req.type === "return_request") requestType = "Return Request"
-
+  if (req.type === "cancellation_request")  requestType = "Order Cancellation"  
   // Build row style without conflicting shorthand/longhand
   const rowStyle = {
     ...styles.row,

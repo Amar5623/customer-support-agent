@@ -258,6 +258,27 @@ async def _pg_approve_request(
             f"Your refund via {req['refund_method'].replace('_', ' ')} "
             f"will be processed within 5–7 business days of receiving the return."
         )
+    elif req["type"] == "cancellation_request":
+        # Flip order status to 'Cancelled'.
+        # We normalise the existing value first so both 'cancelled' and
+        # 'Cancelled' rows get updated cleanly.
+        await session.execute(
+            text("""
+                UPDATE orders
+                SET    order_status = 'Cancelled'
+                WHERE  order_id = :order_id
+                  AND  LOWER(order_status) NOT IN ('cancelled', 'delivered', 'shipped')
+            """),
+            {"order_id": req["order_id"]}
+        )
+ 
+        approval_message = (
+            f"Your cancellation request for order "
+            f"#{str(req['order_id'])[-8:].upper()} has been approved. "
+            "Your refund will be returned to your original payment method "
+            "within 3–5 business days. "
+            "No further action is needed on your end."
+        )
 
     else:
         # Fallback for any future request types
@@ -329,6 +350,13 @@ async def _pg_reject_request(
         f"Reason: {note or 'No reason provided'}. "
         "If you have further questions please contact our support team."
     )
+    elif req["type"] == "cancellation_request":
+        rejection_message = (
+            "Unfortunately your cancellation request could not be approved. "
+            f"Reason: {note or 'No reason provided'}. "
+            "If your order has already shipped, please wait for it to arrive "
+            "and then initiate a return through our support chat."
+        )
     else:
         rejection_message = (
         "Unfortunately your delivery date change request could not be approved. "

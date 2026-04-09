@@ -16,6 +16,7 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
   // Detect request type
   const isDateChange = request.type === "date_change"
   const isReturn     = request.type === "return_request"
+  const isCancellation  = request.type === "cancellation_request" 
 
   // Existing variables for date change (kept unchanged)
   const currentDate   = order.current_delivery || request.current_value
@@ -52,9 +53,10 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
         {/* Header */}
         <div style={styles.header}>
           <div>
-            <p style={styles.headerEyebrow}>
-              {isDateChange ? "Delivery date change" : 
-               isReturn ? "Return Request" : "Request"}
+             <p style={styles.headerEyebrow}>
+              {isDateChange   ? "Delivery date change" :
+               isReturn       ? "Return Request"       :
+               isCancellation ? "Order Cancellation"   : "Request"}
             </p>
             <h3 style={styles.headerTitle}>
               <span className="mono">#{(request.order_id || '').slice(-8).toUpperCase()}</span>
@@ -119,6 +121,26 @@ export default function DetailDrawer({ request, onApprove, onReject, onClose }) 
                   ? "Covered by Leafy" 
                   : "Paid by Customer"
               } />
+              <Row label="Submitted" value={
+                <span className="mono" style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
+                  {formatDateTime(request.created_at)}
+                </span>
+              } />
+              <Row label="Status" value={
+                <span className={`badge badge-${request.status}`}>{request.status}</span>
+              } />
+            </Section>
+          )}
+          {/* ==================== CANCELLATION REQUEST SECTION ==================== */}
+          {isCancellation && (
+            <Section title="Cancellation Details">
+              <Row label="Reason" value={
+                request.reason
+                  ? request.reason.replace(/_/g, " ")
+                  : '—'
+              } />
+              <Row label="Refund Method" value="Original Payment Method" />
+              <Row label="Refund Timeline" value="3–5 business days after approval" />
               <Row label="Submitted" value={
                 <span className="mono" style={{ fontSize: '11.5px', color: 'var(--text-muted)' }}>
                   {formatDateTime(request.created_at)}

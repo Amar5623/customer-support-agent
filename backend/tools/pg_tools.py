@@ -14,12 +14,6 @@ from datetime import datetime, date, timezone
 logger = logging.getLogger(__name__)
 
 # ── 0. Think Tool ───────────────────────────────────────────────────────────────
-# A no-op tool that forces the model to externalise its reasoning before
-# calling any data-fetching tool. Costs almost nothing (result is just
-# {"ok": true}) but prevents the most common agent mistakes on smaller models:
-# Calling get_order_details without a confirmed ID
-# Calling change_delivery_date without reading warehouse date first
-# Making a tool call when the answer is already in history
 class ThinkTool(BaseTool):
     @property
     def name(self) -> str:
@@ -48,19 +42,21 @@ class ThinkTool(BaseTool):
             },
             "required": ["reasoning"]
         }
+
     async def execute(self, **kwargs: Any) -> dict:
-            reasoning = kwargs.get("reasoning", "")
-            logger.debug(f"[THINK] {reasoning[:200]}")
-            return {
-                "ok": True,
-                "instruction": (
-                    "Reasoning recorded. Now act on your plan: "
-                    "call the required tool directly. "
-                    "Do NOT call think again until you have new data."
-                )
-            }
-    
-# ── 1. Get Order History (list) ─────────────────────────────────────────────
+        reasoning = kwargs.get("reasoning", "")
+        logger.debug(f"[THINK] {reasoning[:200]}")
+        return {
+            "ok": True,
+            "instruction": (
+                "Reasoning recorded. Now act on your plan: "
+                "call the required tool directly. "
+                "Do NOT call think again until you have new data."
+            )
+        }
+
+
+# ── 1. Get Order History ─────────────────────────────────────────────────────
 
 class GetOrderHistoryPG(BaseTool):
     def __init__(self, session_factory):
@@ -165,7 +161,7 @@ class GetOrderHistoryPG(BaseTool):
             return self.error(f"Failed to retrieve order history: {str(e)}")
 
 
-# ── 2. Get Order Details (single, full) ─────────────────────────────────────
+# ── 2. Get Order Details ─────────────────────────────────────────────────────
 
 class GetOrderDetailsPG(BaseTool):
     def __init__(self, session_factory):
@@ -202,7 +198,7 @@ class GetOrderDetailsPG(BaseTool):
             },
             "required": ["email"]
         }
- 
+
     async def execute(self, **kwargs: Any) -> dict:
         email    = kwargs.get("email", "").strip().lower()
         order_id = kwargs.get("order_id", "").strip() or None
@@ -213,7 +209,6 @@ class GetOrderDetailsPG(BaseTool):
         try:
             async with self._session_factory() as session:
 
-                # ── 1. Verify user exists in users table ─────────────────
                 user_result = await session.execute(
                     text("SELECT id, email FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -221,7 +216,6 @@ class GetOrderDetailsPG(BaseTool):
                 if not user_result.mappings().first():
                     return self.error(f"No account found for email: {email}")
 
-                # ── 2. Find matching customer record by same email ────────
                 customer_result = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -232,7 +226,6 @@ class GetOrderDetailsPG(BaseTool):
 
                 customer_id = customer["customer_id"]
 
-                # ── 3. If no order_id, find the latest order_id first ────
                 if not order_id:
                     latest_result = await session.execute(
                         text("""
@@ -245,20 +238,16 @@ class GetOrderDetailsPG(BaseTool):
                         {"customer_id": customer_id}
                     )
                     latest = latest_result.mappings().first()
-
                     if not latest:
                         return self.success({
                             "orders": [],
                             "message": "No orders found for this account."
                         })
-
                     order_id  = latest["order_id"]
                     is_latest = True
                 else:
                     is_latest = False
 
-                # ── 4. Fetch full details for the resolved order_id ──────
-                # Aggregate payments per order to avoid row duplication
                 rows = await session.execute(
                     text("""
                         SELECT
@@ -301,10 +290,9 @@ class GetOrderDetailsPG(BaseTool):
                 if not rows:
                     return self.error(f"No order found with ID {order_id}.")
 
-                # ── 5. Build response ────────────────────────────────────
                 first = rows[0]
                 order = {
-                    "email":        email,
+                    "email":              email,
                     "order_id":           first["order_id"],
                     "status":             first["order_status"],
                     "placed_at":          str(first["order_purchase_timestamp"]) if first["order_purchase_timestamp"] else None,
@@ -330,9 +318,9 @@ class GetOrderDetailsPG(BaseTool):
         except Exception as e:
             logger.exception(f"get_order_details_pg failed for {email}")
             return self.error(f"Failed to retrieve order: {str(e)}")
-        
 
-# ── 2. Get Order Status ─────────────────────────────────────────────────────────
+
+# ── 3. Get Order Status ──────────────────────────────────────────────────────
 
 class GetOrderStatusPG(BaseTool):
     def __init__(self, session_factory):
@@ -379,7 +367,6 @@ class GetOrderStatusPG(BaseTool):
         try:
             async with self._session_factory() as session:
 
-                # ── 1. Verify user exists ────────────────────────────────
                 user_result = await session.execute(
                     text("SELECT id FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -387,7 +374,6 @@ class GetOrderStatusPG(BaseTool):
                 if not user_result.mappings().first():
                     return self.error(f"No account found for email: {email}")
 
-                # ── 2. Resolve customer_id ───────────────────────────────
                 customer_result = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -398,7 +384,6 @@ class GetOrderStatusPG(BaseTool):
 
                 customer_id = customer["customer_id"]
 
-                # ── 3. If no order_id, use latest ────────────────────────
                 if not order_id:
                     latest_result = await session.execute(
                         text("""
@@ -414,7 +399,6 @@ class GetOrderStatusPG(BaseTool):
                         return self.error("No orders found for this account.")
                     order_id = latest["order_id"]
 
-                # ── 4. Fetch status — with ownership check ───────────────
                 row_result = await session.execute(
                     text("""
                         SELECT
@@ -455,7 +439,7 @@ class GetOrderStatusPG(BaseTool):
                 raw_status = row["order_status"] or "unavailable"
 
                 result = {
-                    "email":        email,
+                    "email":       email,
                     "order_id":    order_id,
                     "status":      raw_status,
                     "explanation": row["status_description"],
@@ -479,26 +463,27 @@ class GetOrderStatusPG(BaseTool):
             logger.exception(f"get_order_status_pg failed for email={email}, order_id={order_id}")
             return self.error(f"Failed to retrieve order status: {str(e)}")
 
-# ── 4. Change Delivery Date ─────────────────────────────────────────────────
+
+# ── 4. Change Delivery Date ──────────────────────────────────────────────────
 
 class ChangeDeliveryDatePG(BaseTool):
     def __init__(self, session_factory):
         self._session_factory = session_factory
- 
+
     @property
     def name(self) -> str:
         return "change_delivery_date"
- 
+
     @property
     def description(self) -> str:
         return (
-    "Use this to change WHEN an order is delivered — the delivery DATE only. "
-    "DO NOT use this for address changes — use change_delivery_address instead. "
-    "Use when the customer asks to change, reschedule, or delay their delivery date. "
-    "If the customer hasn't specified which order, call get_order_history first. "
-    "Never call this tool with a guessed or invented date."
-)
- 
+            "Use this to change WHEN an order is delivered — the delivery DATE only. "
+            "DO NOT use this for address changes — use change_delivery_address instead. "
+            "Use when the customer asks to change, reschedule, or delay their delivery date. "
+            "If the customer hasn't specified which order, call get_order_history first. "
+            "Never call this tool with a guessed or invented date."
+        )
+
     @property
     def parameters(self) -> dict:
         return {
@@ -519,33 +504,32 @@ class ChangeDeliveryDatePG(BaseTool):
             },
             "required": ["email", "order_id", "requested_date"]
         }
- 
+
     async def execute(self, **kwargs: Any) -> dict:
         email          = kwargs.get("email", "").strip().lower()
         order_id       = kwargs.get("order_id", "").strip()
         requested_date = kwargs.get("requested_date", "").strip()
- 
+
         if not email:
             return self.error("email is required.")
         if not order_id:
             return self.error("order_id is required.")
         if not requested_date:
             return self.error("requested_date is required.")
- 
+
         try:
             req_dt = datetime.strptime(requested_date, "%Y-%m-%d")
         except ValueError:
             return self.error(
                 f"Invalid date format '{requested_date}'. Please use YYYY-MM-DD."
             )
- 
+
         if req_dt.date() <= datetime.utcnow().date():
             return self.error("Requested date must be in the future.")
- 
+
         try:
             async with self._session_factory() as session:
- 
-                # ── 1. Verify user ───────────────────────────────────────
+
                 user_result = await session.execute(
                     text("SELECT id FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -553,10 +537,9 @@ class ChangeDeliveryDatePG(BaseTool):
                 user = user_result.mappings().first()
                 if not user:
                     return self.error(f"No account found for email: {email}")
- 
+
                 user_id = user["id"]
- 
-                # ── 2. Verify order ownership ────────────────────────────
+
                 customer_result = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -564,7 +547,7 @@ class ChangeDeliveryDatePG(BaseTool):
                 customer = customer_result.mappings().first()
                 if not customer:
                     return self.error("No order history found for this account.")
- 
+
                 order_result = await session.execute(
                     text("""
                         SELECT order_id, order_status, order_estimated_delivery_date
@@ -577,22 +560,19 @@ class ChangeDeliveryDatePG(BaseTool):
                 order = order_result.mappings().first()
                 if not order:
                     return self.error(f"No order found with ID {order_id}.")
- 
-                # ── 3. Check terminal states ─────────────────────────────
+
                 status = order["order_status"]
                 if status in ("delivered", "cancelled", "shipped"):
                     return self.success({
                         "outcome": "rejected",
                         "reason": (
-                            "Your order has already been shipped and the delivery address "
-                            "cannot be changed at this stage. If the package is returned to us, "
-                            "we will reship it to your correct address at no charge."
+                            "Your order has already been shipped and the delivery date "
+                            "cannot be changed at this stage."
                         ),
                         "email":    email,
                         "order_id": order_id,
                     })
- 
-                # ── 4. Check for existing pending request ────────────────
+
                 existing_result = await session.execute(
                     text("""
                         SELECT id, requested_date
@@ -609,21 +589,17 @@ class ChangeDeliveryDatePG(BaseTool):
                         "outcome": "already_pending",
                         "reason":  (
                             "There is already a pending date change request for this order. "
-                            "Our team is reviewing it and will confirm within 24 hours. "
-                            "Please wait for that confirmation before submitting a new request."
+                            "Our team is reviewing it and will confirm within 24 hours."
                         ),
                         "existing_requested_date": str(existing["requested_date"]),
                         "request_id":              existing["id"],
                         "email":                   email,
                         "order_id":                order_id,
                     })
- 
-                # ── 5. Insert pending request (session_id left NULL here) ─
-                #       routes.py will backfill it immediately after the agent
-                #       returns, using the route's own injected pg_session.
+
                 now        = datetime.utcnow()
                 request_id = str(uuid.uuid4())
- 
+
                 await session.execute(
                     text("""
                         INSERT INTO pending_requests
@@ -645,8 +621,7 @@ class ChangeDeliveryDatePG(BaseTool):
                     }
                 )
                 await session.commit()
- 
-                # ── 6. Broadcast to admin CRM ────────────────────────────
+
                 try:
                     from backend.api.websocket import ws_manager
                     await ws_manager.broadcast_to_admins({
@@ -656,7 +631,7 @@ class ChangeDeliveryDatePG(BaseTool):
                     })
                 except Exception as broadcast_err:
                     logger.warning(f"Admin broadcast failed: {broadcast_err}")
- 
+
                 return self.success({
                     "outcome":        "pending_approval",
                     "request_id":     request_id,
@@ -668,11 +643,12 @@ class ChangeDeliveryDatePG(BaseTool):
                     "email":          email,
                     "order_id":       order_id,
                 })
- 
+
         except Exception as e:
             logger.exception(f"change_delivery_date failed for {order_id}")
             return self.error(f"Failed to process date change request: {str(e)}")
- 
+
+
 # ── 5. Change Delivery Address ───────────────────────────────────────────────
 
 class ChangeDeliveryAddressPG(BaseTool):
@@ -693,20 +669,20 @@ class ChangeDeliveryAddressPG(BaseTool):
             "Shipped, delivered, and cancelled orders cannot be changed. "
             "Collect full_address, city, state, pincode from the customer before calling. "
             "Never guess or invent address fields."
-)
+        )
 
     @property
     def parameters(self) -> dict:
         return {
             "type": "object",
             "properties": {
-            "email":        {"type": "string", "description": "Customer email"},
-            "order_id":     {"type": "string", "description": "Order ID confirmed by customer"},
-            "full_address": {"type": "string", "description": "New street address"},
-            "city":         {"type": "string", "description": "New city"},
-            "state":        {"type": "string", "description": "New state"},
-            "pincode": {"type": "string", "description": "New zip/pincode"},
-        },
+                "email":        {"type": "string", "description": "Customer email"},
+                "order_id":     {"type": "string", "description": "Order ID confirmed by customer"},
+                "full_address": {"type": "string", "description": "New street address"},
+                "city":         {"type": "string", "description": "New city"},
+                "state":        {"type": "string", "description": "New state"},
+                "pincode":      {"type": "string", "description": "New zip/pincode"},
+            },
             "required": ["email", "order_id", "full_address", "city", "state", "pincode"]
         }
 
@@ -716,9 +692,8 @@ class ChangeDeliveryAddressPG(BaseTool):
         full_address = kwargs.get("full_address", "").strip()
         city         = kwargs.get("city", "").strip()
         state        = kwargs.get("state", "").strip()
-        pincode = kwargs.get("pincode", "").strip()
+        pincode      = kwargs.get("pincode", "").strip()
 
-        # ── Input validation ─────────────────────────────────────────────────
         if not email:
             return self.error("email is required.")
         if not order_id:
@@ -740,7 +715,6 @@ class ChangeDeliveryAddressPG(BaseTool):
         try:
             async with self._session_factory() as session:
 
-                # ── 1. Verify user ───────────────────────────────────────────
                 user_result = await session.execute(
                     text("SELECT id FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -749,7 +723,6 @@ class ChangeDeliveryAddressPG(BaseTool):
                 if not user:
                     return self.error(f"No account found for email: {email}")
 
-                # ── 2. Verify order ownership ────────────────────────────────
                 customer_result = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -777,7 +750,6 @@ class ChangeDeliveryAddressPG(BaseTool):
                 if not order:
                     return self.error(f"No order found with ID {order_id}.")
 
-                # ── 3. Check terminal states ─────────────────────────────────
                 status = order["order_status"].lower()
                 if status in ("delivered", "cancelled", "shipped"):
                     reason_map = {
@@ -794,7 +766,7 @@ class ChangeDeliveryAddressPG(BaseTool):
                         "email":    email,
                         "order_id": order_id,
                     })
-                # ── 4. PROCESSING → direct update ────────────────────────────
+
                 if status == "processing":
                     await session.execute(
                         text("""
@@ -815,13 +787,11 @@ class ChangeDeliveryAddressPG(BaseTool):
                     )
                     await session.commit()
 
-                    # Notify customer via WS (session_id backfilled by routes.py)
-                    # We broadcast to admins too for visibility
                     try:
                         from backend.api.websocket import ws_manager
                         await ws_manager.broadcast_to_admins({
-                            "type":     "address_updated_directly",
-                            "order_id": order_id,
+                            "type":        "address_updated_directly",
+                            "order_id":    order_id,
                             "new_address": formatted_address,
                         })
                     except Exception as broadcast_err:
@@ -838,7 +808,6 @@ class ChangeDeliveryAddressPG(BaseTool):
                         "order_id":    order_id,
                     })
 
-                # ── 5. Any other status (e.g. 'invoiced') ───────────────────
                 return self.error(
                     f"Address cannot be changed for an order with status '{status}'."
                 )
@@ -846,15 +815,18 @@ class ChangeDeliveryAddressPG(BaseTool):
         except Exception as e:
             logger.exception(f"change_delivery_address failed for {order_id}")
             return self.error(f"Failed to process address change: {str(e)}")
- 
+
+
+# ── 6. Get Payment Info ──────────────────────────────────────────────────────
+
 class GetPaymentInfoPG(BaseTool):
     def __init__(self, session_factory):
         self._session_factory = session_factory
- 
+
     @property
     def name(self) -> str:
         return "get_payment_info"
- 
+
     @property
     def description(self) -> str:
         return (
@@ -867,7 +839,7 @@ class GetPaymentInfoPG(BaseTool):
             "Only ask the customer to specify an order if they have already seen a list "
             "from get_order_history and explicitly want a different order's payment info."
         )
- 
+
     @property
     def parameters(self) -> dict:
         return {
@@ -887,26 +859,24 @@ class GetPaymentInfoPG(BaseTool):
             },
             "required": ["email"]
         }
- 
+
     async def execute(self, **kwargs: Any) -> dict:
         email    = kwargs.get("email", "").strip().lower()
         order_id = kwargs.get("order_id", "").strip() or None
- 
+
         if not email:
             return self.error("email is required.")
- 
+
         try:
             async with self._session_factory() as session:
- 
-                # ── 1. Verify user account exists ────────────────────────
+
                 user_row = await session.execute(
                     text("SELECT id FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
                 )
                 if not user_row.mappings().first():
                     return self.error(f"No account found for email: {email}")
- 
-                # ── 2. Resolve customer_id (order data lives here) ───────
+
                 cust_row = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -914,10 +884,9 @@ class GetPaymentInfoPG(BaseTool):
                 customer = cust_row.mappings().first()
                 if not customer:
                     return self.error("No order history found for this account.")
- 
+
                 customer_id = customer["customer_id"]
- 
-                # ── 3. Resolve order_id — default to latest ──────────────
+
                 is_latest = False
                 if not order_id:
                     latest_row = await session.execute(
@@ -935,8 +904,7 @@ class GetPaymentInfoPG(BaseTool):
                         return self.error("No orders found for this account.")
                     order_id  = latest["order_id"]
                     is_latest = True
- 
-                # ── 4. Ownership check + basic order info ────────────────
+
                 order_row = await session.execute(
                     text("""
                         SELECT
@@ -953,40 +921,31 @@ class GetPaymentInfoPG(BaseTool):
                 )
                 order = order_row.mappings().first()
                 if not order:
-                    return self.error(
-                        f"No order found with ID '{order_id}' for this account."
-                    )
- 
-                # ── 5. Fetch all payment rows for the order ───────────────
+                    return self.error(f"No order found with ID '{order_id}' for this account.")
+
                 pay_rows = await session.execute(
                     text("""
-                        SELECT
-                            payment_type,
-                            payment_value
-                        FROM  order_payments
-                        WHERE order_id = :order_id
+                        SELECT payment_type, payment_value
+                        FROM   order_payments
+                        WHERE  order_id = :order_id
                     """),
                     {"order_id": order_id}
                 )
                 payments = pay_rows.mappings().all()
- 
+
                 if not payments:
-                    return self.error(
-                        f"No payment records found for order '{order_id}'."
-                    )
- 
-                # ── 6. Aggregate summary ─────────────────────────────────
+                    return self.error(f"No payment records found for order '{order_id}'.")
+
                 total_paid    = sum(float(p["payment_value"]) for p in payments)
                 payment_types = list({p["payment_type"] for p in payments})
- 
-                # Per-method subtotals
+
                 method_totals: dict[str, float] = {}
                 for p in payments:
                     ptype = p["payment_type"]
                     method_totals[ptype] = round(
                         method_totals.get(ptype, 0.0) + float(p["payment_value"]), 2
                     )
- 
+
                 breakdown = [
                     {
                         "method": p["payment_type"],
@@ -994,32 +953,31 @@ class GetPaymentInfoPG(BaseTool):
                     }
                     for p in payments
                 ]
- 
+
                 return self.success({
-                    "email":           email,    
-                    "order_id":        order_id,
-                    "is_latest_order": is_latest,
-                    "order_status":    order["order_status"],
-                    "ordered_at":      str(order["order_purchase_timestamp"])
-                                       if order["order_purchase_timestamp"] else None,
-                    "estimated_delivery": str(order["order_estimated_delivery_date"])
-                                          if order["order_estimated_delivery_date"] else None,
-                    # ── Payment summary ──────────────────────────────────
-                    "total_paid":      round(total_paid, 2),
-                    "payment_methods": payment_types,   # e.g. ["credit_card", "voucher"]
-                    "method_totals":   method_totals,   # e.g. {"credit_card": 120.0}
-                    "transactions":    breakdown,        # full line-by-line
+                    "email":              email,
+                    "order_id":           order_id,
+                    "is_latest_order":    is_latest,
+                    "order_status":       order["order_status"],
+                    "ordered_at":         str(order["order_purchase_timestamp"]) if order["order_purchase_timestamp"] else None,
+                    "estimated_delivery": str(order["order_estimated_delivery_date"]) if order["order_estimated_delivery_date"] else None,
+                    "total_paid":         round(total_paid, 2),
+                    "payment_methods":    payment_types,
+                    "method_totals":      method_totals,
+                    "transactions":       breakdown,
                     "message": (
                         "Here are the payment details for your "
                         + ("most recent order." if is_latest else f"order {order_id}.")
                     ),
                 })
- 
+
         except Exception as e:
-            logger.exception(
-                f"get_payment_info failed for email={email}, order_id={order_id}"
-            )
+            logger.exception(f"get_payment_info failed for email={email}, order_id={order_id}")
             return self.error(f"Failed to retrieve payment info: {str(e)}")
+
+
+# ── 7. Get Seller Info ───────────────────────────────────────────────────────
+
 class GetSellerInfoPG(BaseTool):
     def __init__(self, session_factory):
         self._session_factory = session_factory
@@ -1044,7 +1002,7 @@ class GetSellerInfoPG(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "email": {"type": "string", "description": "Customer's email address."},
+                "email":    {"type": "string", "description": "Customer's email address."},
                 "order_id": {"type": "string", "description": "Specific order ID. OMIT to use latest order."}
             },
             "required": ["email"]
@@ -1144,14 +1102,14 @@ class GetSellerInfoPG(BaseTool):
                             "item_price":       float(row["price"]),
                             "freight_value":    float(row["freight_value"]),
                             "seller": {
-                                "seller_id":   row["seller_id"],
-                                "shop_name":   row["shop_name"],
-                                "phone":       row["phone"],
-                                "email":       row["seller_email"],
-                                "city":        row["seller_city"],
-                                "state":       row["seller_state"],
-                                "address":     row["full_address"],
-                                "pincode":     row["pincode"],
+                                "seller_id": row["seller_id"],
+                                "shop_name": row["shop_name"],
+                                "phone":     row["phone"],
+                                "email":     row["seller_email"],
+                                "city":      row["seller_city"],
+                                "state":     row["seller_state"],
+                                "address":   row["full_address"],
+                                "pincode":   row["pincode"],
                             }
                         }
                         for row in rows
@@ -1164,7 +1122,11 @@ class GetSellerInfoPG(BaseTool):
 
         except Exception as e:
             logger.exception(f"get_seller_info failed for email={email}, order_id={order_id}")
-            return self.error(f"Failed to retrieve seller info: {str(e)}") 
+            return self.error(f"Failed to retrieve seller info: {str(e)}")
+
+
+# ── 8. Get User Profile ──────────────────────────────────────────────────────
+
 class GetUserProfilePG(BaseTool):
     def __init__(self, session_factory):
         self._session_factory = session_factory
@@ -1238,7 +1200,7 @@ class GetUserProfilePG(BaseTool):
                     "address":        profile["full_address"],
                     "pincode":        profile["pincode"],
                     "role":           profile["role"],
-                    "account_status": profile["account_status"],   # "active" or "deactive"
+                    "account_status": profile["account_status"],
                     "is_active":      profile["is_active"],
                     "loyalty_tier":   profile["loyalty_tier"],
                     "loyalty_points": profile["loyalty_points"],
@@ -1248,8 +1210,9 @@ class GetUserProfilePG(BaseTool):
         except Exception as e:
             logger.exception(f"get_user_profile failed for email={email}")
             return self.error(f"Failed to retrieve profile: {str(e)}")
-        
-# ── 6. Initiate Return ───────────────────────────────────────────────────────
+
+
+# ── 9. Initiate Return ───────────────────────────────────────────────────────
 
 class InitiateReturnPG(BaseTool):
     def __init__(self, session_factory):
@@ -1274,9 +1237,9 @@ class InitiateReturnPG(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "email":         {"type": "string", "description": "Customer email"},
-                "order_id":      {"type": "string", "description": "Order ID confirmed by customer"},
-                "reason":        {
+                "email":    {"type": "string", "description": "Customer email"},
+                "order_id": {"type": "string", "description": "Order ID confirmed by customer"},
+                "reason": {
                     "type": "string",
                     "enum": [
                         "defective_damaged",
@@ -1322,20 +1285,14 @@ class InitiateReturnPG(BaseTool):
         try:
             async with self._session_factory() as session:
 
-                # ── 1. Verify user ───────────────────────────────────────────
                 user_result = await session.execute(
-                    text("""
-                        SELECT id, loyalty_tier
-                        FROM users
-                        WHERE LOWER(email) = :email
-                    """),
+                    text("SELECT id, loyalty_tier FROM users WHERE LOWER(email) = :email"),
                     {"email": email}
                 )
                 user = user_result.mappings().first()
                 if not user:
                     return self.error(f"No account found for email: {email}")
 
-                # ── 2. Verify order ownership ────────────────────────────────
                 customer_result = await session.execute(
                     text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
                     {"email": email}
@@ -1361,7 +1318,6 @@ class InitiateReturnPG(BaseTool):
                 if not order:
                     return self.error(f"No order found with ID {order_id}.")
 
-                # ── 3. Check order status ────────────────────────────────────
                 status = order["order_status"]
                 if status != "delivered":
                     return self.success({
@@ -1373,8 +1329,6 @@ class InitiateReturnPG(BaseTool):
                         "current_status": status,
                     })
 
-                # ── 4. Resolve delivery date ─────────────────────────────────
-                # Prefer actual delivery date, fall back to estimated
                 delivery_date = (
                     order["order_delivered_customer_date"]
                     or order["order_estimated_delivery_date"]
@@ -1384,7 +1338,6 @@ class InitiateReturnPG(BaseTool):
                         "Order is missing delivery date — cannot evaluate return window."
                     )
 
-                # Normalise to timezone-aware datetime
                 if isinstance(delivery_date, datetime):
                     if delivery_date.tzinfo is None:
                         delivery_date = delivery_date.replace(tzinfo=timezone.utc)
@@ -1396,7 +1349,6 @@ class InitiateReturnPG(BaseTool):
                         tzinfo=timezone.utc
                     )
 
-                # ── 5. Check return window ───────────────────────────────────
                 loyalty_tier  = user["loyalty_tier"] or "Bronze"
                 return_window = 45 if loyalty_tier == "Platinum" else 30
                 now           = datetime.now(timezone.utc)
@@ -1418,7 +1370,6 @@ class InitiateReturnPG(BaseTool):
                         "days_elapsed":  days_elapsed,
                     })
 
-                # ── 6. Check for existing pending return ─────────────────────
                 existing_result = await session.execute(
                     text("""
                         SELECT id FROM pending_requests
@@ -1440,7 +1391,6 @@ class InitiateReturnPG(BaseTool):
                         "request_id": existing["id"],
                     })
 
-                # ── 7. Determine return shipping responsibility ───────────────
                 leafy_covers = {
                     "defective_damaged",
                     "wrong_item_received",
@@ -1450,7 +1400,6 @@ class InitiateReturnPG(BaseTool):
                     "leafy" if reason in leafy_covers else "customer"
                 )
 
-                # ── 8. Insert pending request ────────────────────────────────
                 request_id = str(uuid.uuid4())
                 now        = datetime.now(timezone.utc)
 
@@ -1469,21 +1418,20 @@ class InitiateReturnPG(BaseTool):
                         )
                     """),
                     {
-                        "id":                   request_id,
-                        "type":                 "return_request",
-                        "status":               "pending",
-                        "order_id":             order_id,
-                        "user_id":              user["id"],
-                        "reason":               reason,
-                        "items":                json.dumps(items),
-                        "refund_method":        refund_method,
-                        "shipping_covered_by":  shipping_covered_by,
-                        "created_at":           now,
+                        "id":                  request_id,
+                        "type":                "return_request",
+                        "status":              "pending",
+                        "order_id":            order_id,
+                        "user_id":             user["id"],
+                        "reason":              reason,
+                        "items":               json.dumps(items),
+                        "refund_method":       refund_method,
+                        "shipping_covered_by": shipping_covered_by,
+                        "created_at":          now,
                     }
                 )
                 await session.commit()
 
-                # ── 9. Broadcast to admin CRM ────────────────────────────────
                 try:
                     from backend.api.websocket import ws_manager
                     await ws_manager.broadcast_to_admins({
@@ -1504,9 +1452,9 @@ class InitiateReturnPG(BaseTool):
                         f"Return shipping will be covered by "
                         f"{'Leafy' if shipping_covered_by == 'leafy' else 'you (the customer)'}."
                     ),
-                    "items":                     items,
-                    "reason":                    reason,
-                    "refund_method":             refund_method,
+                    "items":                      items,
+                    "reason":                     reason,
+                    "refund_method":              refund_method,
                     "return_shipping_covered_by": shipping_covered_by,
                 })
 
@@ -1514,9 +1462,289 @@ class InitiateReturnPG(BaseTool):
             logger.exception(f"initiate_return failed for {order_id}")
             return self.error(f"Failed to process return request: {str(e)}")
 
+
+# ── 10. Cancel Order ─────────────────────────────────────────────────────────
+#
+# Two paths based on order_status:
+#   processing / Processing  →  cancel immediately, set order_status = 'Cancelled'
+#   invoiced   / Invoiced    →  insert pending_request, admin must approve
+#   anything else            →  return outcome='not_cancellable' with explanation
+
+class CancelOrderPG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    @property
+    def name(self) -> str:
+        return "cancel_order"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Cancel a customer's order. "
+            "Processing orders are cancelled immediately — no admin needed. "
+            "Invoiced orders require admin approval — collect a cancellation reason "
+            "from the customer before calling this tool. "
+            "Shipped, delivered, created, approved, and already-cancelled orders "
+            "cannot be cancelled — advise shipped/delivered customers to return instead. "
+            "DO NOT use for returns — use initiate_return for delivered orders. "
+            "Always confirm the order_id with the customer before calling."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "description": "Customer's email address."
+                },
+                "order_id": {
+                    "type": "string",
+                    "description": "The exact order ID the customer wants to cancel."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Cancellation reason collected from the customer. "
+                        "Required for invoiced orders before calling this tool. "
+                        "For processing orders use 'not_required'. "
+                        "Examples: 'changed_mind', 'ordered_by_mistake', "
+                        "'found_better_price', 'delivery_too_slow', 'other'."
+                    ),
+                },
+            },
+            "required": ["email", "order_id", "reason"],
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        email    = kwargs.get("email", "").strip().lower()
+        order_id = kwargs.get("order_id", "").strip()
+        reason   = kwargs.get("reason", "other").strip()
+
+        if not email:
+            return self.error("email is required.")
+        if not order_id:
+            return self.error("order_id is required.")
+
+        try:
+            async with self._session_factory() as session:
+
+                # ── 1. Verify user ───────────────────────────────────────────
+                user_result = await session.execute(
+                    text("SELECT id FROM users WHERE LOWER(email) = :email LIMIT 1"),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+
+                user_id = user["id"]
+
+                # ── 2. Verify order ownership ────────────────────────────────
+                customer_result = await session.execute(
+                    text("SELECT customer_id FROM customers WHERE LOWER(email) = :email"),
+                    {"email": email}
+                )
+                customer = customer_result.mappings().first()
+                if not customer:
+                    return self.error("No order history found for this account.")
+
+                order_result = await session.execute(
+                    text("""
+                        SELECT order_id, order_status
+                        FROM   orders
+                        WHERE  order_id    = :order_id
+                          AND  customer_id = :customer_id
+                        LIMIT  1
+                    """),
+                    {"order_id": order_id, "customer_id": customer["customer_id"]}
+                )
+                order = order_result.mappings().first()
+                if not order:
+                    return self.error(f"No order found with ID {order_id}.")
+
+                raw_status   = order["order_status"] or ""
+                status_lower = raw_status.lower()
+
+                # ── 3. Already cancelled ─────────────────────────────────────
+                if status_lower == "cancelled":
+                    return self.success({
+                        "outcome":      "already_cancelled",
+                        "order_id":     order_id,
+                        "order_status": raw_status,
+                        "message": (
+                            "This order has already been cancelled. "
+                            "Your refund should arrive within 3–5 business days "
+                            "to your original payment method."
+                        ),
+                    })
+
+                # ── 4. Processing → auto-cancel immediately ───────────────────
+                if status_lower == "processing":
+                    await session.execute(
+                        text("""
+                            UPDATE orders
+                            SET    order_status = 'Cancelled'
+                            WHERE  order_id = :order_id
+                        """),
+                        {"order_id": order_id}
+                    )
+                    await session.commit()
+
+                    logger.info(
+                        f"CancelOrderPG: order {order_id} cancelled immediately "
+                        f"(user_id={user_id}, reason={reason})"
+                    )
+
+                    return self.success({
+                        "outcome":         "cancelled",
+                        "order_id":        order_id,
+                        "refund_method":   "original_payment",
+                        "refund_timeline": "3–5 business days",
+                        "message": (
+                            f"Your order #{order_id[-8:].upper()} has been cancelled. "
+                            "Your refund will be returned to your original payment method "
+                            "within 3–5 business days."
+                        ),
+                    })
+
+                # ── 5. Invoiced → create pending_request for admin approval ───
+                if status_lower == "invoiced":
+                    # Guard against duplicate pending cancellation
+                    existing_result = await session.execute(
+                        text("""
+                            SELECT id FROM pending_requests
+                            WHERE  order_id = :order_id
+                              AND  type     = 'cancellation_request'
+                              AND  status   = 'pending'
+                            LIMIT  1
+                        """),
+                        {"order_id": order_id}
+                    )
+                    if existing_result.mappings().first():
+                        return self.success({
+                            "outcome":  "already_pending",
+                            "order_id": order_id,
+                            "message": (
+                                "A cancellation request for this order is already awaiting "
+                                "admin review. We'll notify you as soon as a decision is made."
+                            ),
+                        })
+
+                    request_id = str(uuid.uuid4())
+                    now        = datetime.now(timezone.utc)
+
+                    await session.execute(
+                        text("""
+                            INSERT INTO pending_requests (
+                                id,
+                                type,
+                                status,
+                                order_id,
+                                user_id,
+                                requested_date,
+                                current_date,
+                                session_id,
+                                reason,
+                                refund_method,
+                                created_at
+                            ) VALUES (
+                                :id,
+                                'cancellation_request',
+                                'pending',
+                                :order_id,
+                                :user_id,
+                                :now,
+                                :now,
+                                NULL,
+                                :reason,
+                                'original_payment',
+                                :now
+                            )
+                        """),
+                        {
+                            "id":       request_id,
+                            "order_id": order_id,
+                            "user_id":  user_id,
+                            "now":      now,
+                            "reason":   reason,
+                        }
+                    )
+                    await session.commit()
+
+                    logger.info(
+                        f"CancelOrderPG: pending_request={request_id} created for "
+                        f"order {order_id} (user_id={user_id}, reason={reason})"
+                    )
+
+                    # Broadcast to admin CRM so the queue updates immediately
+                    try:
+                        from backend.api.websocket import ws_manager
+                        await ws_manager.broadcast_to_admins({
+                            "type":         "new_request",
+                            "request_id":   request_id,
+                            "order_id":     order_id,
+                            "request_type": "cancellation_request",
+                        })
+                    except Exception as broadcast_err:
+                        logger.warning(f"Admin broadcast failed: {broadcast_err}")
+
+                    return self.success({
+                        "outcome":    "request_submitted",
+                        "order_id":   order_id,
+                        "request_id": request_id,
+                        "message": (
+                            f"Your cancellation request for order "
+                            f"#{order_id[-8:].upper()} has been submitted "
+                            "and is pending admin review. "
+                            "We'll notify you once a decision has been made. "
+                            "If approved, your refund will be returned to your "
+                            "original payment method within 3–5 business days."
+                        ),
+                    })
+
+                # ── 6. Not cancellable ────────────────────────────────────────
+                if status_lower in ("shipped", "delivered"):
+                    tip = (
+                        "Your order has already been dispatched and can no longer be cancelled. "
+                        "Once it arrives, you can initiate a return through this chat."
+                    )
+                elif status_lower == "created":
+                    tip = (
+                        "Your order is still being set up and cannot be cancelled yet. "
+                        "Please try again in a few minutes once it moves to processing."
+                    )
+                elif status_lower == "approved":
+                    tip = (
+                        "Your order has been approved for processing and cannot be cancelled "
+                        "at this stage. Please wait until it moves to processing or contact "
+                        "our support team for assistance."
+                    )
+                else:
+                    tip = (
+                        f"Orders with status '{raw_status}' cannot be cancelled. "
+                        "Please contact our support team if you need further help."
+                    )
+
+                return self.success({
+                    "outcome":      "not_cancellable",
+                    "order_id":     order_id,
+                    "order_status": raw_status,
+                    "message":      tip,
+                })
+
+        except Exception as e:
+            logger.exception(f"CancelOrderPG.execute failed — order_id={order_id}")
+            return self.error(f"Unexpected error while processing cancellation: {str(e)}")
+
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
+
 def get_all_pg_tools(session_factory) -> list[BaseTool]:
     return [
-        ThinkTool(),  # always include the ThinkTool for better agent reasoning
+        ThinkTool(),
         GetOrderHistoryPG(session_factory),
         GetOrderDetailsPG(session_factory),
         GetOrderStatusPG(session_factory),
@@ -1524,6 +1752,7 @@ def get_all_pg_tools(session_factory) -> list[BaseTool]:
         ChangeDeliveryAddressPG(session_factory),
         GetPaymentInfoPG(session_factory),
         GetSellerInfoPG(session_factory),
-        GetUserProfilePG(session_factory), 
+        GetUserProfilePG(session_factory),
         InitiateReturnPG(session_factory),
-    ]   
+        CancelOrderPG(session_factory),       # ← NEW
+    ]

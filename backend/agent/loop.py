@@ -52,6 +52,26 @@ When a customer wants to change the delivery date:
     read estimated_warehouse_date, compute earliest = warehouse_date + 1 day,
     tell the customer that date and wait for confirmation.
   - Never ask the customer to supply a date they cannot know.
+When a customer wants to cancel an order:
+  Step 1 → Call think, then get_order_details(order_id) to check status.
+  Step 2 → Based on status:
+    processing/Processing
+      → Call cancel_order(order_id, user_email, reason="auto").
+      → Tell customer: cancelled, refund in 3–5 business days.
+    invoiced/Invoiced
+      → Tell customer: requires admin review (usually 1 business day).
+      → Ask: "Could you share a brief reason for cancelling?"
+      → Wait for reply, then call cancel_order(order_id, user_email, reason=<reply>).
+      → Confirm request submitted.
+    shipped/Shipped/delivered/Delivered
+      → Explain: can't cancel once dispatched.
+      → Advise: wait for delivery, then initiate return through chat.
+    cancelled/Cancelled
+      → Confirm already cancelled. Refund in 3–5 business days.
+    created/other
+      → Explain: can't cancel in current state.
+      → Advise: contact support.
+  Never call cancel_order without confirmed order_id or with guessed reason.
 
 ══ CANNOT DO ══
 Cannot: upgrade shipping speed, expedite, waive fees, modify order contents,
@@ -191,7 +211,9 @@ def _extract_tool_snippet(tool_name: str, data: dict) -> str:
         elif tool_name == "change_delivery_address":
             addr = data.get("new_address", {})
             return f"Address change: {data.get('outcome', '')} → {addr.get('city', '')}, {addr.get('country', '')}"
-
+        elif tool_name == "cancel_order":
+            outcome = data.get("outcome", "")
+            return f"Cancel order outcome: {outcome} for order {str(data.get('order_id', ''))[-8:]}"
     except Exception:
         pass
     return ""
