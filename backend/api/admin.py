@@ -427,6 +427,87 @@ async def _pg_get_stats(session: AsyncSession) -> dict:
         "total":    row["total"],
     }
 
+@router.get("/escalations")
+async def get_escalations(
+    status:       str          = "open",
+    session:      AsyncSession = Depends(get_pg_session),
+    _:            dict         = Depends(get_current_admin),
+):
+    result = await session.execute(
+        text("""
+            SELECT
+                e.id,
+                e.reason,
+                e.status,
+                e.priority,
+                e.order_id,
+                e.customer_note,
+                e.created_at,
+                e.resolved_at,
+                e.resolved_by,
+                e.resolution_note,
+                u.name,
+                u.surname,
+                u.email,
+                u.loyalty_tier
+            FROM escalations e
+            LEFT JOIN users u ON u.id = e.user_id
+            WHERE e.status = :status
+            ORDER BY e.priority DESC, e.created_at ASC
+            LIMIT 50
+        """),
+        {"status": status}
+    )
+    rows = result.mappings().all()
+
+    escalations = []
+    for row in rows:
+        escalations.append({
+            "id":              row["id"],
+            "reason":          row["reason"],
+            "status":          row["status"],
+            "priority":        row["priority"],
+            "order_id":        row["order_id"],
+            "customer_note":   row["customer_note"],
+            "created_at":      str(row["created_at"]) if row["created_at"] else None,
+            "resolved_at":     str(row["resolved_at"]) if row["resolved_at"] else None,
+            "resolved_by":     row["resolved_by"],
+            "resolution_note": row["resolution_note"],
+            "customer": {
+                "name":        f"{row['name']} {row['surname']}",
+                "email":       row["email"],
+                "loyaltyTier": row["loyalty_tier"],
+            },
+        })
+    return {"escalations": escalations}
+
+
+@router.post("/escalations/{escalation_id}/resolve")
+async def resolve_escalation(
+    escalation_id: str,
+    body:          ResolutionBody,
+    session:       AsyncSession = Depends(get_pg_session),
+    admin:         dict         = Depends(get_current_admin),
+):
+    now = datetime.now(timezone.utc)
+    await session.execute(
+        text("""
+            UPDATE escalations
+            SET status          = 'resolved',
+                resolved_at     = :resolved_at,
+                resolved_by     = :resolved_by,
+                resolution_note = :note
+            WHERE id = :id
+        """),
+        {
+            "id":          escalation_id,
+            "resolved_at": now,
+            "resolved_by": admin["email"],
+            "note":        body.note,
+        }
+    )
+    await session.commit()
+    return {"status": "resolved", "escalation_id": escalation_id}
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 

@@ -159,6 +159,34 @@ async def chat(
                     {"$set": {"session_id": body.session_id}},
                     sort=[(("created_at", DESCENDING))],
                 )
+        
+        # After pending_tool_called block, add separately:
+        escalation_called = any(
+            tc.tool_name == "escalate_to_human"
+            for tc in response.tool_calls
+        )
+
+        if escalation_called:
+            if settings.db_tool_mode == "postgres" and pg_session is not None:
+                await pg_session.execute(
+                    text("""
+                        UPDATE escalations
+                        SET session_id = :session_id
+                        WHERE id = (
+                            SELECT id FROM escalations
+                            WHERE user_id    = :user_id
+                            AND status     = 'open'
+                            AND session_id IS NULL
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                        )
+                    """),
+                    {
+                        "session_id": body.session_id,
+                        "user_id":    str(current_user["_id"]),
+                    }
+                )
+                await pg_session.commit()
 
         # ── Persist the full turn ─────────────────────────────────────────────
         await conversations.append_turn(

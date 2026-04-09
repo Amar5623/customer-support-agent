@@ -2309,6 +2309,186 @@ class CancelOrderPG(BaseTool):
             logger.exception(f"CancelOrderPG.execute failed — order_id={order_id}")
             return self.error(f"Unexpected error while processing cancellation: {str(e)}")
 
+# ── 9. Escalate to Human ─────────────────────────────────────────────────────
+
+class EscalateToHumanPG(BaseTool):
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    @property
+    def name(self) -> str:
+        return "escalate_to_human"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Escalate a customer issue to a human agent when it cannot be resolved automatically. "
+            "Use when: customer requests human/manager, billing dispute, account suspended, "
+            "legal threat, chargeback mention, order >$500 dispute, damage outside return window, "
+            "delivered but not received after 24h, refund not received after 10 business days, "
+            "or customer has contacted support 3+ times about same issue. "
+            "DO NOT use for issues the agent can resolve with available tools."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "description": "Customer email"
+                },
+                "reason": {
+                    "type": "string",
+                    "enum": [
+                        "delivered_not_received",
+                        "refund_not_received",
+                        "damage_outside_return_window",
+                        "account_suspended",
+                        "data_request",
+                        "legal_threat",
+                        "high_value_dispute",
+                        "repeated_contact",
+                        "customer_requested",
+                        "other"
+                    ],
+                    "description": "Reason for escalation"
+                },
+                "order_id": {
+                    "type": "string",
+                    "description": "Related order ID if applicable"
+                },
+                "customer_note": {
+                    "type": "string",
+                    "description": "Brief summary of what the customer said"
+                },
+            },
+            "required": ["email", "reason", "customer_note"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        email         = kwargs.get("email", "").strip().lower()
+        reason        = kwargs.get("reason", "").strip()
+        order_id      = kwargs.get("order_id", "").strip()
+        customer_note = kwargs.get("customer_note", "").strip()
+
+        if not email:
+            return self.error("email is required.")
+        if not reason:
+            return self.error("reason is required.")
+        if not customer_note:
+            return self.error("customer_note is required.")
+
+        try:
+            async with self._session_factory() as session:
+
+                # ── 1. Verify user + get loyalty tier ────────────────────────
+                user_result = await session.execute(
+                    text("""
+                        SELECT id, loyalty_tier
+                        FROM users
+                        WHERE LOWER(email) = :email
+                    """),
+                    {"email": email}
+                )
+                user = user_result.mappings().first()
+                if not user:
+                    return self.error(f"No account found for email: {email}")
+
+                # ── 2. Check for existing open escalation ────────────────────
+                existing_result = await session.execute(
+                    text("""
+                        SELECT id FROM escalations
+                        WHERE user_id = :user_id
+                          AND status  = 'open'
+                          AND reason  = :reason
+                        LIMIT 1
+                    """),
+                    {"user_id": user["id"], "reason": reason}
+                )
+                existing = existing_result.mappings().first()
+                if existing:
+                    return self.success({
+                        "outcome":      "already_open",
+                        "escalation_id": existing["id"],
+                        "message": (
+                            "There is already an open escalation for this issue. "
+                            "Our team will contact you within 1–2 business days."
+                        ),
+                    })
+
+                # ── 3. Determine priority (Platinum tier) ────────────────────
+                is_priority = user["loyalty_tier"] == "Platinum"
+
+                # ── 4. Also flag legal threats and high value as priority ─────
+                if reason in ("legal_threat", "high_value_dispute"):
+                    is_priority = True
+
+                # ── 5. Insert escalation ─────────────────────────────────────
+                escalation_id = str(uuid.uuid4())
+                now           = datetime.now(timezone.utc)
+
+                note = customer_note
+                if is_priority:
+                    note = f"[PRIORITY] {note}"
+
+                await session.execute(
+                    text("""
+                        INSERT INTO escalations (
+                            id, user_id, session_id, order_id,
+                            reason, customer_note, priority,
+                            status, created_at
+                        ) VALUES (
+                            :id, :user_id, NULL, :order_id,
+                            :reason, :customer_note, :priority,
+                            'open', :created_at
+                        )
+                    """),
+                    {
+                        "id":            escalation_id,
+                        "user_id":       user["id"],
+                        "order_id":      order_id or None,
+                        "reason":        reason,
+                        "customer_note": note,
+                        "priority":      is_priority,
+                        "created_at":    now,
+                    }
+                )
+                await session.commit()
+
+                # ── 6. Broadcast to admin CRM ────────────────────────────────
+                try:
+                    from backend.api.websocket import ws_manager
+                    await ws_manager.broadcast_to_admins({
+                        "type":          "new_escalation",
+                        "escalation_id": escalation_id,
+                        "order_id":      order_id or None,
+                        "reason":        reason,
+                        "priority":      is_priority,
+                    })
+                except Exception as broadcast_err:
+                    logger.warning(f"Admin broadcast failed: {broadcast_err}")
+
+                # ── 7. Build response based on tier ──────────────────────────
+                sla = "by end of next business day" if is_priority else "within 1–2 business days"
+
+                return self.success({
+                    "outcome":      "escalated",
+                    "escalation_id": escalation_id,
+                    "priority":     is_priority,
+                    "message": (
+                        f"I want to make sure this gets proper attention. "
+                        f"I'm flagging this for our team — you'll hear back "
+                        f"at {email} {sla}. "
+                        f"Keep your order ID handy: {order_id or 'N/A'}."
+                    ),
+                    "sla": sla,
+                })
+
+        except Exception as e:
+            logger.exception(f"escalate_to_human failed for {email}")
+            return self.error(f"Failed to create escalation: {str(e)}")
 
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
@@ -2327,5 +2507,6 @@ def get_all_pg_tools(session_factory) -> list[BaseTool]:
         InitiateReturnPG(session_factory),
         ReportMissingItemPG(session_factory),
         GetRequestStatusPG(session_factory),
-        CancelOrderPG(session_factory),       # ← NEW
+        CancelOrderPG(session_factory),
+        EscalateToHumanPG(session_factory),
     ]
