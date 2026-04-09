@@ -1398,8 +1398,8 @@ class ChangeOrderItem(BaseTool):
         if not target_item:
             return self.error(f"Item '{item_name}' not found in this order.")
 
-        current_size  = target_item.get("size", "")
-        current_color = target_item.get("color", "")
+        current_size  = target_item.get("variant", "").get("size", "")
+        current_color = target_item.get("variant", "").get("color", "")
         check_size    = new_size  if new_size  else current_size
         check_color   = new_color if new_color else current_color
 
