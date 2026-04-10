@@ -326,6 +326,9 @@ async def run_agent(
     # ── Build user message ────────────────────────────────────────────────────
     user_content = request.message
 
+    # ALWAYS inject identity header — not just on first turn.
+    # Without this, after history compression the model loses the email
+    # and guesses a placeholder like customer@example.com on turn 2+.
     identity_parts = []
     if request.user_email:
         identity_parts.append(f"Customer email: {request.user_email}")
