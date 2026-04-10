@@ -15,142 +15,31 @@ logger   = logging.getLogger(__name__)
 settings = get_settings()
 
 # Marker prefix used to encode tool_call history rows as assistant messages.
-# routes.py writes these when rebuilding history; _build_messages() decodes them.
 _TOOL_CALLS_MARKER = "__tool_calls__:"
 
-# Tools that are session-state-prunable:
-# if we can determine from history that they're irrelevant, we drop their schema.
-_TERMINAL_STATUSES = {"Delivered", "Completed", "Cancelled"}
-
-
-def _extract_session_state(messages: list[dict]) -> dict:
-    state = {
-        "order_ids_seen":        set(),
-        "profile_fetched":       False,
-        "order_statuses":        {},
-        "return_topics_mentioned": False,
-        "user_messages_lower":   "",   # ← ADD THIS
-    }
-
-    user_text_parts = []   # ← ADD THIS
-
-    for msg in messages:
-        role = msg.get("role")
-
-        if role == "tool":
-            try:
-                result = json.loads(msg.get("content", "{}"))
-                if not result.get("success"):
-                    continue
-                data = result.get("data", {})
-                if "orders" in data:
-                    for order in data["orders"]:
-                        oid = order.get("order_id", "")
-                        if oid:
-                            state["order_ids_seen"].add(oid)
-                if "_id" in data and "status" in data:
-                    oid = data["_id"]
-                    state["order_ids_seen"].add(oid)
-                    state["order_statuses"][oid] = data.get("status", "")
-                if "email" in data and "loyaltyTier" in data:
-                    state["profile_fetched"] = True
-            except Exception:
-                pass
-
-        if role == "user":
-            content = (msg.get("content") or "").lower()
-            user_text_parts.append(content)   # ← ADD THIS
-            if any(kw in content for kw in ["return", "refund", "exchange", "send back"]):
-                state["return_topics_mentioned"] = True
-
-    state["user_messages_lower"] = " ".join(user_text_parts)   # ← ADD THIS
-    return state
-
-def _prune_schemas(all_schemas: list[dict], state: dict) -> list[dict]:
-    """
-    Given session state, return a filtered list of tool schemas.
-    Only removes schemas provably irrelevant — never removes a tool still needed.
-    """
-    order_ids  = state["order_ids_seen"]
-    statuses   = state["order_statuses"]
-    user_msgs  = state.get("user_messages_lower", "")
-
-    # All known orders are in a terminal state
-    all_terminal = (
-        bool(order_ids) and
-        all(statuses.get(oid, "") in _TERMINAL_STATUSES for oid in order_ids)
-    )
-
-    # Is the customer talking about account/loyalty topics?
-    profile_topic = any(
-        kw in user_msgs for kw in
-        ["loyalty", "points", "tier", "account", "profile", "membership"]
-    )
-
-    # Is the customer talking about returns?
-    return_topic = any(
-        kw in user_msgs for kw in
-        ["return", "refund", "exchange", "send back"]
-    )
-
-    # Is address change relevant?
-    address_topic = any(
-        kw in user_msgs for kw in
-        ["address", "deliver to", "different location", "wrong address"]
-    )
-
-    pruned  = []
-    removed = []
-
-    for schema in all_schemas:
-        tool_name = schema.get("function", {}).get("name", "")
-
-        if tool_name == "get_order_history" and order_ids:
-            removed.append(tool_name); continue
-
-        if tool_name == "get_user_profile" and (state["profile_fetched"] or not profile_topic):
-            removed.append(tool_name); continue
-
-        if tool_name in ("change_delivery_date", "cancel_order") and all_terminal:
-            removed.append(tool_name); continue
-
-        if tool_name == "change_delivery_address" and (all_terminal or not address_topic):
-            removed.append(tool_name); continue
-
-        if tool_name == "get_return_status" and not return_topic:
-            removed.append(tool_name); continue
-
-        pruned.append(schema)
-
-    if removed:
-        saved = len(removed) * 250 * 2
-        logger.info(
-            f"[TOKENS] Schema pruning — removed {len(removed)} schemas "
-            f"({removed}) → saved ~{saved} tokens this turn"
-        )
-    else:
-        logger.info(f"[TOKENS] Schema pruning — no schemas removed ({len(all_schemas)} kept)")
-
-    return pruned
 
 class GroqService(LLMBase):
     """
     Groq implementation of LLMBase.
 
+    With the meta-tool architecture, this service is significantly simpler:
+    - No schema pruning (_prune_schemas removed — not needed with 2 schemas)
+    - No session state extraction (_extract_session_state removed)
+    - The LLM always gets exactly 2 tool schemas (tool_search + tool_invoke)
+    - Tool invocations still go through the same agentic loop
+
+    Token logging is preserved and enhanced:
+    - Logs actual Groq usage per iteration (prompt, completion, total)
+    - Logs cumulative totals at end of request
+    - tool_invoke results are tagged with _invoked_tool for history slimming
+
     Flow per request:
-      Iterative loop — send messages with tool schemas → model may call tools
-      → execute tools → feed results back → repeat until model writes final reply
-      or max_iterations is hit.
-
-    Token logging:
-      Every Groq API call returns usage.prompt_tokens / completion_tokens / total_tokens.
-      We log these per iteration AND accumulate totals for the full request so you
-      can see exactly what each conversation turn costs.
-
-    Schema pruning:
-      After building the message list, we analyse session state from the history
-      and strip tool schemas that are provably irrelevant for this turn. Going from
-      10 schemas to 5-6 saves ~1,000-1,500 tokens per iteration → ~2,000-3,000 per turn.
+      Iterative loop:
+        1. Send messages + 2 meta-tool schemas to Groq
+        2. If model calls think → execute, loop
+        3. If model calls tool_search → execute (returns matching real schemas)
+        4. If model calls tool_invoke → execute real tool, tag result, loop
+        5. If model returns text → done
     """
 
     def __init__(self, tools: list[BaseTool]):
@@ -159,15 +48,20 @@ class GroqService(LLMBase):
         self._tools   = {tool.name: tool for tool in tools}
         self._schemas = [tool.to_groq_schema() for tool in tools]
 
-        # Log schema token cost so we have a baseline
-        schema_token_est = len(self._schemas) * 250
         logger.info(
-            f"[TOKENS] GroqService init — {len(self._schemas)} tool schemas "
-            f"(~{schema_token_est} tokens each API call if unpruned)"
+            f"[GROQ] GroqService init — {len(self._schemas)} schemas "
+            f"(meta-tool mode: schemas are always tool_search + tool_invoke)"
         )
 
-    async def chat(self, messages, tools, system_prompt):
-        groq_messages     = self._build_messages(messages, system_prompt)
+    async def chat(
+        self,
+        messages:      list[Message],
+        tools:         list[BaseTool],
+        system_prompt: str,
+    ) -> AgentResponse:
+
+        groq_messages = self._build_messages(messages, system_prompt)
+
         all_tool_calls:   list[ToolCall]   = []
         all_tool_results: list[ToolResult] = []
 
@@ -175,11 +69,9 @@ class GroqService(LLMBase):
         total_completion_tokens = 0
         total_tokens_used       = 0
 
-        active_schemas = _prune_schemas(self._schemas, _extract_session_state(groq_messages))
-
-        max_iterations       = settings.agent_max_iterations
-        iteration            = 0
-        consecutive_think_only = 0   # ← ADD HERE, before the while loop
+        max_iterations         = settings.agent_max_iterations
+        iteration              = 0
+        consecutive_think_only = 0
 
         try:
             while iteration < max_iterations:
@@ -188,21 +80,10 @@ class GroqService(LLMBase):
 
                 is_last_iteration = (iteration == max_iterations)
 
-                if iteration > 1:
-                    active_schemas = _prune_schemas(
-                        self._schemas, _extract_session_state(groq_messages)
-                    )
-
-                schema_token_est = len(active_schemas) * 250
-                logger.info(
-                    f"[TOKENS] Iteration {iteration}: sending {len(active_schemas)} schemas "
-                    f"(~{schema_token_est} tokens)"
-                )
-
                 response = await self._client.chat.completions.create(
                     model       = self._model,
                     messages    = groq_messages,
-                    tools       = active_schemas,
+                    tools       = self._schemas,
                     tool_choice = "none" if is_last_iteration else "auto",
                     temperature = settings.groq_temperature,
                     max_tokens  = settings.groq_max_tokens,
@@ -221,16 +102,16 @@ class GroqService(LLMBase):
                     )
 
                 choice  = response.choices[0]
-                message = choice.message   # ← message is defined HERE
+                message = choice.message
 
-                # ── No tool calls → model is done ────────────────────────
+                # ── No tool calls → model is done ─────────────────────────
                 if not message.tool_calls:
                     logger.info(
                         f"[TOKENS] ══ REQUEST COMPLETE ══ "
                         f"iterations: {iteration} | "
-                        f"total prompt tokens: {total_prompt_tokens} | "
-                        f"total completion tokens: {total_completion_tokens} | "
-                        f"TOTAL TOKENS USED: {total_tokens_used}"
+                        f"prompt tokens: {total_prompt_tokens} | "
+                        f"completion tokens: {total_completion_tokens} | "
+                        f"TOTAL: {total_tokens_used}"
                     )
                     return AgentResponse(
                         message      = message.content or "",
@@ -238,50 +119,50 @@ class GroqService(LLMBase):
                         tool_results = all_tool_results,
                     )
 
-                # ── Tool calls present → execute and loop ─────────────────
+                # ── Tool calls present → execute and loop ──────────────────
                 groq_messages.append({
                     "role":       "assistant",
                     "content":    None,
                     "tool_calls": message.tool_calls,
                 })
 
-                tool_result_dicts, tool_calls_made, tool_results_made = (
+                result_dicts, tool_calls_made, tool_results_made = (
                     await self._execute_tool_calls(message.tool_calls)
                 )
                 all_tool_calls.extend(tool_calls_made)
                 all_tool_results.extend(tool_results_made)
-                groq_messages.extend(tool_result_dicts)
+                groq_messages.extend(result_dicts)
 
-                # ── Consecutive think-only guard ──────────────────────────
-                # ↓↓↓ THIS BLOCK comes AFTER _execute_tool_calls, where
-                #     tool_calls_made is defined. message is also in scope here.
+                # ── Consecutive think-only guard ───────────────────────────
                 real_tools_this_iter = [
-                    tc for tc in tool_calls_made if tc.tool_name != "think"
+                    tc for tc in tool_calls_made
+                    if tc.tool_name not in ("think", "tool_search")
                 ]
                 if not real_tools_this_iter:
                     consecutive_think_only += 1
                     logger.info(
-                        f"[TOKENS] Think-only iteration "
-                        f"{consecutive_think_only}/3 (no real tool executed)"
+                        f"[TOKENS] Think/search-only iteration "
+                        f"{consecutive_think_only}/3 (no data tool executed)"
                     )
                     if consecutive_think_only >= 3:
                         logger.warning(
-                            "[LOOP] 3 consecutive think-only iterations — "
+                            "[LOOP] 3 consecutive think/search-only iterations — "
                             "injecting nudge and forcing text reply"
                         )
                         groq_messages.append({
                             "role": "user",
                             "content": (
-                                "[SYSTEM] You have called think 3 times without calling "
-                                "any action tool. You MUST now either: (a) call the required "
-                                "tool directly with no think call, or (b) reply to the customer "
-                                "explaining what you can and cannot do. Do NOT call think again."
+                                "[SYSTEM] You have called think or tool_search 3 times "
+                                "without calling tool_invoke. You MUST now either: "
+                                "(a) call tool_invoke directly with a confirmed tool_id, or "
+                                "(b) reply to the customer explaining what you can and cannot do. "
+                                "Do NOT call think or tool_search again."
                             )
                         })
                         final_resp = await self._client.chat.completions.create(
                             model       = self._model,
                             messages    = groq_messages,
-                            tools       = active_schemas,
+                            tools       = self._schemas,
                             tool_choice = "none",
                             temperature = settings.groq_temperature,
                             max_tokens  = settings.groq_max_tokens,
@@ -292,7 +173,7 @@ class GroqService(LLMBase):
                         )
                         logger.info(
                             f"[TOKENS] ══ REQUEST COMPLETE (think-loop broken) ══ "
-                            f"TOTAL TOKENS USED: {total_tokens_used}"
+                            f"TOTAL: {total_tokens_used}"
                         )
                         return AgentResponse(
                             message      = final_content,
@@ -300,7 +181,7 @@ class GroqService(LLMBase):
                             tool_results = all_tool_results,
                         )
                 else:
-                    consecutive_think_only = 0  # reset on any real tool call
+                    consecutive_think_only = 0
 
                 logger.info(
                     f"[TOKENS] Iteration {iteration}: called "
@@ -310,9 +191,9 @@ class GroqService(LLMBase):
             # max_iterations hit
             logger.info(
                 f"[TOKENS] ══ REQUEST COMPLETE (max iterations) ══ "
-                f"total prompt tokens: {total_prompt_tokens} | "
-                f"total completion tokens: {total_completion_tokens} | "
-                f"TOTAL TOKENS USED: {total_tokens_used}"
+                f"prompt: {total_prompt_tokens} | "
+                f"completion: {total_completion_tokens} | "
+                f"TOTAL: {total_tokens_used}"
             )
             return AgentResponse(
                 message      = "I wasn't able to complete that in time. Please try again.",
@@ -323,12 +204,13 @@ class GroqService(LLMBase):
         except Exception as e:
             logger.exception("GroqService.chat failed")
             return AgentResponse(
-                message = (
+                message=(
                     "I'm having trouble connecting right now. "
                     "Please try again in a moment."
                 ),
-                error = str(e),
+                error=str(e),
             )
+
     # ── Private ────────────────────────────────────────────────────────────────
 
     def _build_messages(
@@ -395,16 +277,20 @@ class GroqService(LLMBase):
         self,
         tool_calls: list[Any],
     ) -> tuple[list[dict], list[ToolCall], list[ToolResult]]:
+        """
+        Execute all tool calls returned by the model in this iteration.
+
+        For tool_invoke specifically:
+        - The result from ToolInvokeTool already has _invoked_tool tagged.
+        - We store this tag in the result content so that:
+          a) conversation_store._slim_tool_result can apply the right slimming
+          b) loop.py _build_history_summary can show the real tool name, not "tool_invoke"
+
+        The tag is stored in JSON but is harmless — the LLM ignores unknown fields.
+        """
         result_dicts     = []
         tool_calls_out   = []
         tool_results_out = []
-
-        # If the model called `think` alongside real tools, only execute `think`
-        # this iteration. This enforces genuine sequential reasoning:
-        #   iteration N   → think only
-        #   iteration N+1 → data tool with a real plan
-        # Without this, think+data_tool in one call wastes the think output
-        # and still costs all schema tokens for both.
 
         for tc in tool_calls:
             tool_name = tc.function.name
@@ -421,7 +307,7 @@ class GroqService(LLMBase):
                 result = {"success": False, "error": f"Unknown tool: {tool_name}"}
                 logger.warning(f"Groq called unknown tool: {tool_name}")
             else:
-                logger.info(f"Executing tool: {tool_name} with args: {arguments}")
+                logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
                 result = await tool.execute(**arguments)
 
             result_content = json.dumps(result)

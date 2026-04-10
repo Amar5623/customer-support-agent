@@ -35,59 +35,67 @@ def _slim_tool_result(tool_name: str, content_str: str) -> str:
     """
     Strip heavyweight fields from tool results before persisting.
     Returns the original string if parsing fails or tool is not handled.
+ 
+    With the meta-tool architecture, the stored tool_name is "tool_invoke".
+    The real tool name is tagged inside the result JSON as _invoked_tool
+    by ToolInvokeTool.execute(). We read that tag to apply the right slimming.
+ 
+    The _invoked_tool tag itself is stripped after use — it's internal only.
     """
     try:
         result = json.loads(content_str)
         if not result.get("success"):
             return content_str  # keep error messages intact
-
+ 
+        # ── Resolve the real tool name ──────────────────────────────────────
+        # In meta-tool mode: result["_invoked_tool"] = "get_order_details" etc.
+        # In direct mode (legacy / fallback): tool_name is already the real name.
+        real_tool_name = result.pop("_invoked_tool", None) or tool_name
+ 
         data = result.get("data", {})
-
-        if tool_name == "get_order_details" and isinstance(data, dict):
-            # Drop internal DB fields
+ 
+        if real_tool_name == "get_order_details" and isinstance(data, dict):
             for f in _FIELDS_TO_DROP_FROM_ORDERS:
                 data.pop(f, None)
-            # Slim products — keep only name, price, amount
             if "products" in data:
                 data["products"] = [
                     {k: v for k, v in p.items() if k in _PRODUCT_FIELDS_TO_KEEP}
                     for p in data["products"]
                 ]
-            # Drop verbose status_history (we keep current status field)
             data.pop("status_history", None)
-            # Drop internal request details — keep outcome summary only
             if "delivery_date_change_request" in data:
                 req = data["delivery_date_change_request"]
                 data["delivery_date_change_request"] = {
-                    "status": req.get("status"),
+                    "status":         req.get("status"),
                     "requested_date": req.get("requested_date"),
                 }
             result["data"] = data
-
-        elif tool_name == "get_order_history" and isinstance(data, dict):
-            # Slim each order in the list
+ 
+        elif real_tool_name == "get_order_history" and isinstance(data, dict):
             orders = data.get("orders", [])
             data["orders"] = [
                 {
                     "order_id":           o.get("order_id"),
                     "status":             o.get("status"),
                     "estimated_delivery": o.get("estimated_delivery"),
-                    "items":              o.get("items", [])[:3],  # max 3 items shown
+                    "items":              o.get("items", [])[:3],
                 }
                 for o in orders
             ]
             result["data"] = data
-
-        elif tool_name == "get_user_profile" and isinstance(data, dict):
-            # Keep only the fields the agent actually uses
+ 
+        elif real_tool_name == "get_user_profile" and isinstance(data, dict):
             keep = {"name", "surname", "email", "loyaltyTier", "loyaltyPoints", "accountStatus"}
             result["data"] = {k: v for k, v in data.items() if k in keep}
-
+ 
+        # tool_search and tool_invoke results are small — no slimming needed.
+        # think results are tiny — no slimming needed.
+ 
         return json.dumps(result)
-
+ 
     except Exception:
         return content_str  # never crash — return original on any error
-
+    
 class ConversationStore:
     def __init__(self, db=None, session_factory=None):
         self._db              = db

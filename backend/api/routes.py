@@ -102,11 +102,12 @@ async def chat(
 
         # Link the pending_request to this session if a date-change was made.
         # (Allows admin approval to push a WebSocket notification to the right customer.)
-        # REPLACE WITH
         TOOLS_NEEDING_SESSION = {"change_delivery_date", "initiate_return", "change_order_item"}
 
         if db is not None and any(
-            tc.tool_name in TOOLS_NEEDING_SESSION for tc in response.tool_calls
+            (tc.tool_name in TOOLS_NEEDING_SESSION) or
+            (tc.tool_name == "tool_invoke" and tc.arguments.get("tool_id") in TOOLS_NEEDING_SESSION)
+            for tc in response.tool_calls
         ):
             from pymongo import DESCENDING
             await db.pending_requests.find_one_and_update(
