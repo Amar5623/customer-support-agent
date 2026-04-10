@@ -1,11 +1,8 @@
-// frontend/src/hooks/useChat.js
-
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   sendMessage,
   getConversationHistory,
-  getNewSession,
-  closeConversation,
+  getNewSession
 } from "../api.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -45,7 +42,8 @@ export function useChat(user) {
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
   const wsRef = useRef(null);
-
+  const sessionRef = useRef(null); 
+  
   // ── WebSocket connect ──────────────────────────────────────────────────────
   const connectWs = useCallback((sid) => {
     if (wsRef.current) {
@@ -89,10 +87,13 @@ export function useChat(user) {
     let cancelled = false;
 
     async function init() {
+      let fetchedConversations = [];
+
       try {
         const data = await getConversationHistory();
         if (!cancelled) {
-          setConversations(data.conversations || []);
+          fetchedConversations = data.conversations || [];
+          setConversations(fetchedConversations);
         }
       } catch { /* sidebar fails silently */ }
 
@@ -102,19 +103,68 @@ export function useChat(user) {
         const sid = await getNewSession();
         if (!cancelled) {
           setSessionId(sid);
+          sessionRef.current = sid;
           connectWs(sid);
+
+          // Restore any saved notifications for this session from DB
+          const currentConv = fetchedConversations.find(
+            c => c.session_id === sid
+          );
+          if (currentConv) {
+            const savedNotifications = (currentConv.messages || [])
+              .filter(m => m.role === "notification")
+              .map(m => makeNotification(m.content, m.status || "approved"));
+            if (savedNotifications.length > 0) {
+              setMessages(prev => [...prev, ...savedNotifications]);
+            }
+          }
         }
       } catch {
         if (!cancelled) {
           const sid = crypto.randomUUID();
           setSessionId(sid);
+          sessionRef.current = sid;
           connectWs(sid);
         }
       }
     }
 
     init();
-    return () => { cancelled = true; };
+
+    // Re-check DB for missed notifications when tab becomes visible again
+    const handleVisibility = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const data = await getConversationHistory();
+        const sid  = sessionRef.current;   // ← use ref not state
+        if (!sid) return;
+        const currentConv = (data.conversations || []).find(
+          c => c.session_id === sid
+        );
+        if (!currentConv) return;
+
+        const dbNotifications = (currentConv.messages || [])
+          .filter(m => m.role === "notification")
+          .map(m => makeNotification(m.content, m.status || "approved"));
+
+        setMessages(prev => {
+          const existingContents = new Set(
+            prev.filter(m => m.isNotification).map(m => m.content)
+          );
+          const newOnes = dbNotifications.filter(
+            n => !existingContents.has(n.content)
+          );
+          return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
+        });
+      } catch { /* fails silently */ }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, [user, connectWs]);
 
   // ── Load a past conversation from the sidebar ──────────────────────────────
@@ -172,6 +222,7 @@ export function useChat(user) {
     try {
       const sid = await getNewSession();
       setSessionId(sid);
+      sessionRef.current = sid;
       connectWs(sid);
     } catch {
       const sid = crypto.randomUUID();

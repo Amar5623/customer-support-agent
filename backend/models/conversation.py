@@ -18,7 +18,7 @@ class Conversation(Base):
 
     messages: Mapped[list["ConversationMessage"]] = relationship(
         "ConversationMessage",
-        back_populates="conversation",
+        back_populates="conversation", 
         order_by="ConversationMessage.timestamp",
     )
 

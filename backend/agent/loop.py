@@ -293,6 +293,7 @@ async def run_agent(
             header = "[" + " | ".join(identity_parts) + "]"
             user_content = f"{header}\n{request.message}"
     else:
+        identity_parts = []
         if request.user_email:
             identity_parts.append(f"Customer email: {request.user_email}")
         if request.order_id:
