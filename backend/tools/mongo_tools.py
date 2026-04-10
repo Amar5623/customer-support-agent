@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
+import re
 
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -1243,6 +1244,447 @@ class InitiateReturn(BaseTool):
             "return_shipping_covered_by": return_shipping_covered_by,
         })
 
+# ── 11. Change Order Item Characteristics (Size, Color, etc.) ─────────────────
+
+class ChangeOrderItem(BaseTool):
+    def __init__(self, db: AsyncIOMotorDatabase):
+        self._db = db
+
+    @property
+    def name(self) -> str:
+        return "change_order_item"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Change the size or colour of an item in a confirmed order. "
+            "For orders in 'Processing' or 'In process' status, checks stock in the "
+            "products table and creates a pending approval request if available. "
+            "For any other active status, checks warehouse stock and creates a pending "
+            "approval request if available. "
+            "In both cases the request always goes to admin for approval — nothing is changed directly. "
+            "If the customer hasn't specified which order, call get_order_history first. "
+            "Always confirm the new size and/or colour with the customer before calling this tool."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "Confirmed order ID from get_order_history"
+                },
+                "item_name": {
+                    "type": "string",
+                    "description": "Exact product name from the order"
+                },
+                "new_size": {
+                    "type": "string",
+                    "description": "New size (e.g. M, L). Omit if not changing size."
+                },
+                "new_color": {
+                    "type": "string",
+                    "description": "New colour. Omit if not changing colour."
+                },
+                "email": {
+                    "type": "string",
+                    "description": "Customer email address"
+                }
+            },
+            "required": ["order_id", "item_name", "email"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        order_id  = kwargs.get("order_id", "").strip()
+        item_name = kwargs.get("item_name", "").strip()
+        new_size  = kwargs.get("new_size", "").strip()
+        new_color = kwargs.get("new_color", "").strip()
+        email     = kwargs.get("email", "").strip().lower()
+
+        if not order_id or not item_name or not email:
+            return self.error("order_id, item_name, and email are required.")
+
+        if not new_size and not new_color:
+            return self.error("At least one of new_size or new_color must be provided.")
+
+        try:
+            oid = ObjectId(order_id)
+        except Exception:
+            return self.error("Invalid order ID format.")
+
+        # ── Resolve user ─────────────────────────────────────────────────────
+        user = await self._db.users.find_one(
+            {"email": {"$regex": f"^{email}$", "$options": "i"}},
+            {"_id": 1}
+        )
+        if not user:
+            return self.error(f"No account found for email: {email}")
+
+        # ── Fetch order ──────────────────────────────────────────────────────
+        order = await self._db.orders.find_one({"_id": oid})
+        if not order:
+            return self.error(f"No order found with ID {order_id}.")
+
+        if str(order.get("userId")) != str(user["_id"]):
+            return self.error("This order does not belong to the provided email.")
+
+        status   = order.get("status", "")
+        products = order.get("products", [])
+
+        # ── Terminal states — no action possible ─────────────────────────────
+        if status in ("Delivered", "Completed", "Cancelled"):
+            return self.success({
+                "outcome": "rejected",
+                "reason": (
+                    f"Your order is '{status}'. "
+                    "Item characteristics can no longer be changed at this stage."
+                ),
+            })
+
+        # ── Block if a change request is already pending ──────────────────────
+        existing = order.get("item_change_request")
+        if existing and existing.get("status") == "pending":
+            return self.success({
+                "outcome": "already_pending",
+                "reason": (
+                    "There is already a pending item change request for this order. "
+                    "Our team is reviewing it and will confirm within 24 hours. "
+                    "Please wait for that confirmation before submitting a new request."
+                ),
+                "request_id": existing.get("request_id"),
+            })
+
+        # ── Find the item in the order ────────────────────────────────────────
+        target_item = None
+        for item in products:
+            if item.get("name", "").lower() == item_name.lower():
+                target_item = item
+                break
+
+        if not target_item:
+            return self.error(f"Item '{item_name}' not found in this order.")
+
+        current_size  = target_item.get("variant", "").get("size", "")
+        current_color = target_item.get("variant", "").get("color", "")
+        check_size    = new_size  if new_size  else current_size
+        check_color   = new_color if new_color else current_color
+
+        now              = datetime.now(timezone.utc)
+        stock_source     = None
+        warehouse_doc    = None
+
+        # ════════════════════════════════════════════════════════════════════
+        # SCENARIO 1 — Processing / In process: check products table
+        # ════════════════════════════════════════════════════════════════════
+        if status in ("Processing", "In process"):
+
+            product_doc = await self._db.products.find_one(
+                {"name": {"$regex": f"^{re.escape(item_name)}$", "$options": "i"}},
+                {"variants": 1, "name": 1}
+            )
+
+            if not product_doc:
+                return self.error(
+                    f"Product '{item_name}' not found in the product catalogue."
+                )
+
+            matched_variant = None
+            for variant in product_doc.get("variants", []):
+                size_match  = (variant.get("size", "").lower()  == check_size.lower())  if check_size  else True
+                color_match = (variant.get("color", "").lower() == check_color.lower()) if check_color else True
+                if size_match and color_match:
+                    matched_variant = variant
+                    break
+
+            if not matched_variant:
+                return self.success({
+                    "outcome": "rejected",
+                    "reason": (
+                        f"The variant "
+                        f"{'size ' + check_size + ' ' if check_size else ''}"
+                        f"{'colour ' + check_color if check_color else ''}"
+                        f"does not exist for '{item_name}'."
+                    ),
+                })
+
+            if matched_variant.get("stock", 0) <= 0:
+                return self.success({
+                    "outcome": "out_of_stock",
+                    "reason": (
+                        f"The requested variant of '{item_name}' "
+                        f"({'size ' + check_size + ', ' if check_size else ''}"
+                        f"{'colour ' + check_color if check_color else ''}) "
+                        "is currently out of stock."
+                    ),
+                })
+
+            stock_source = "products"
+
+        # ════════════════════════════════════════════════════════════════════
+        # SCENARIO 2 — Any other active status: check warehouse stock
+        # ════════════════════════════════════════════════════════════════════
+        else:
+            warehouse_doc = await self._db.warehouses.find_one({
+                "inventory": {
+                    "$elemMatch": {
+                        "name":  {"$regex": f"^{re.escape(item_name)}$", "$options": "i"},
+                        "size":  check_size  if check_size  else {"$exists": True},
+                        "color": check_color if check_color else {"$exists": True},
+                        "stock": {"$gt": 0},
+                    }
+                }
+            })
+
+            if not warehouse_doc:
+                return self.success({
+                    "outcome": "rejected",
+                    "reason": (
+                        f"Your order is currently '{status}'. "
+                        f"The requested variant of '{item_name}' "
+                        f"({'size ' + check_size + ', ' if check_size else ''}"
+                        f"{'colour ' + check_color if check_color else ''}) "
+                        "is not available in any warehouse. "
+                        "We are unable to process this change at this time."
+                    ),
+                })
+
+            stock_source = "warehouse"
+
+        # ── Build change description for status_history note ─────────────────
+        change_parts = []
+        if new_size:
+            change_parts.append(f"size {current_size} → {check_size}")
+        if new_color:
+            change_parts.append(f"colour {current_color} → {check_color}")
+        change_description = ", ".join(change_parts)
+
+        warehouse_note = (
+            f" Stock confirmed in {warehouse_doc.get('city')} warehouse."
+            if warehouse_doc else ""
+        )
+
+        # ── Insert into pending_requests ──────────────────────────────────────
+        pending_doc = {
+            "type":            "item_change",
+            "status":          "pending",
+            "order_id":        oid,
+            "user_id":         order.get("userId"),
+            "item_name":       item_name,
+            "new_size":        check_size,
+            "new_color":       check_color,
+            "old_size":        current_size,
+            "old_color":       current_color,
+            "stock_source":    stock_source,
+            "warehouse_id":    str(warehouse_doc["_id"]) if warehouse_doc else None,
+            "warehouse_city":  warehouse_doc.get("city") if warehouse_doc else None,
+            "order_status":    status,
+            "created_at":      now,
+            "resolved_at":     None,
+            "resolved_by":     None,
+            "resolution_note": None,
+            "session_id":      None,
+        }
+
+        result     = await self._db.pending_requests.insert_one(pending_doc)
+        request_id = str(result.inserted_id)
+
+        # ── Mirror to order + push to status_history ─────────────────────────
+        await self._db.orders.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "item_change_request": {
+                        "request_id":     request_id,
+                        "status":         "pending",
+                        "item_name":      item_name,
+                        "new_size":       check_size,
+                        "new_color":      check_color,
+                        "old_size":       current_size,
+                        "old_color":      current_color,
+                        "warehouse_city": warehouse_doc.get("city") if warehouse_doc else None,
+                        "created_at":     now,
+                    }
+                },
+                "$push": {
+                    "status_history": {
+                        "status":     "Item Change Pending Approval",
+                        "note": (
+                            f"Change request submitted for '{item_name}': "
+                            f"{change_description}.{warehouse_note} "
+                            f"Awaiting admin approval."
+                        ),
+                        "timestamp":  now,
+                        "updated_by": "system",
+                    }
+                }
+            }
+        )
+
+        # ── Broadcast to CRM admins ───────────────────────────────────────────
+        try:
+            from backend.api.websocket import ws_manager
+            await ws_manager.broadcast_to_admins({
+                "type":       "new_request",
+                "request_id": request_id,
+                "order_id":   order_id,
+            })
+        except Exception as broadcast_err:
+            logger.warning(f"Admin broadcast failed: {broadcast_err}")
+
+        return self.success({
+            "outcome":    "pending_approval",
+            "request_id": request_id,
+            "message": (
+                "Your item change request has been submitted and is pending admin approval. "
+                "You will be notified within 24 hours."
+            ),
+            "new_size":  check_size,
+            "new_color": check_color,
+        })
+
+# ── 12. Cancel Order Tool ─────────────────────────────────────────────────────
+class CancelOrder(BaseTool):
+    def __init__(self, db: AsyncIOMotorDatabase):
+        self._db = db
+
+    @property
+    def name(self) -> str:
+        return "cancel_order"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Cancel a customer's order following Leafy's official Cancellation Policy. "
+            "Cancellation is **ONLY allowed** when the order status is 'Processing' or 'In process'. "
+            "If the order is Shipped, In Transit, Out for Delivery, Delivered, or already Cancelled, "
+            "cancellation is not possible — the tool will reject it and explain why. "
+            "On successful cancellation, a full refund including original shipping cost will be issued "
+            "to the original payment method (3–5 business days) or as store credit (instant). "
+            
+            "Important instructions for the agent:\n"
+            "- If the customer says 'cancel my order' without specifying which one, "
+            "first call get_order_history to list their recent orders, then ask which one they want to cancel.\n"
+            "- Always confirm the correct order with the customer before calling this tool.\n"
+            "- You may ask for a reason, but it is optional."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "order_id": {
+                    "type": "string",
+                    "description": "The confirmed order ID to cancel"
+                },
+                "email": {
+                    "type": "string",
+                    "description": "Customer email for verification"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason provided by customer (e.g. 'changed mind', 'found better price')"
+                }
+            },
+            "required": ["order_id", "email"]
+        }
+
+    async def execute(self, **kwargs: Any) -> dict:
+        order_id = kwargs.get("order_id", "").strip()
+        email    = kwargs.get("email", "").strip().lower()
+        reason   = kwargs.get("reason", "").strip()
+
+        if not order_id or not email:
+            return self.error("order_id and email are required.")
+
+        try:
+            oid = ObjectId(order_id)
+        except Exception:
+            return self.error(f"'{order_id}' is not a valid order ID.")
+
+        # Get user
+        user = await self._db.users.find_one(
+            {"email": {"$regex": f"^{email}$", "$options": "i"}},
+            {"_id": 1, "name": 1, "surname": 1}
+        )
+        if not user:
+            return self.error(f"No account found for email: {email}")
+
+        # Get order
+        order = await self._db.orders.find_one({"_id": oid})
+        if not order:
+            return self.error(f"No order found with ID {order_id}.")
+
+        if str(order.get("userId")) != str(user["_id"]):
+            return self.error("This order does not belong to the provided customer.")
+
+        status = order.get("status", "")
+
+        # Policy Check: Only Processing orders can be cancelled
+        if status not in ["Processing", "In process"]:
+            return self.success({
+                "outcome": "rejected",
+                "reason": (
+                    f"Your order is currently '{status}'. "
+                    "According to our policy, orders can only be cancelled while they are still in 'Processing' status. "
+                    "If the order has already shipped, please wait for delivery and initiate a return instead."
+                ),
+                "current_status": status
+            })
+
+        # Check if already cancelled
+        if status == "Cancelled":
+            return self.success({
+                "outcome": "already_cancelled",
+                "reason": "This order has already been cancelled."
+            })
+
+        now = datetime.now(timezone.utc)
+
+        # Perform cancellation
+        await self._db.orders.update_one(
+            {"_id": oid},
+            {
+                "$set": {
+                    "status": "Cancelled",
+                    "cancelled_at": now,
+                    "cancellation_reason": reason or "Customer requested cancellation",
+                    "refund_status": "Pending"
+                },
+                "$push": {
+                    "status_history": {
+                        "status": "Cancelled",
+                        "timestamp": now,
+                        "note": f"Cancelled by customer request. Reason: {reason or 'Not specified'}",
+                        "updated_by": "system"
+                    }
+                }
+            }
+        )
+
+        # Optional: Create a simple cancellation record (for audit)
+        await self._db.cancellations.insert_one({
+            "order_id": oid,
+            "user_id": user["_id"],
+            "reason": reason or "Customer requested",
+            "cancelled_at": now,
+            "refund_amount": order.get("total_amount", 0),   # you may need to calculate this properly
+            "refund_method": "original_payment"
+        })
+
+        return self.success({
+            "outcome": "success",
+            "message": (
+                "Your order has been successfully cancelled. "
+                "A full refund including original shipping cost will be issued to your original payment method "
+                "within 3–5 business days."
+            ),
+            "order_id": order_id,
+            "refund_timeline": "3–5 business days"
+        })
+
 # ── Registry ────────────────────────────────────────────────────────────────────
 
 def get_all_tools(db: AsyncIOMotorDatabase) -> list[BaseTool]:
@@ -1258,4 +1700,6 @@ def get_all_tools(db: AsyncIOMotorDatabase) -> list[BaseTool]:
         GetInvoiceDetails(db),
         GetTotalAmountPaid(db),
         InitiateReturn(db),
+        ChangeOrderItem(db),
+        CancelOrder(db),
     ]
