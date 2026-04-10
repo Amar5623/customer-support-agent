@@ -393,7 +393,7 @@ class ConversationStore:
                 text("SELECT COALESCE(MAX(sequence), 0) FROM conversation_messages WHERE session_id = :sid"),
                 {"sid": session_id}
             )
-            seq = seq_result.scalar() + 1
+            seq = seq_result.scalar()+1
 
             session.add(ConversationMessage(
                 session_id = session_id,

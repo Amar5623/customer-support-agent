@@ -96,7 +96,6 @@ export function useRequests(tab = 'pending') {
 
   // ── Approve / Reject action ───────────────────────────────────────────────────
   const action = useCallback(async (id, type, note = '') => {
-    // Animate the row out first for snappy UX
     setAnimatingOut(prev => new Set([...prev, id]))
 
     try {
@@ -106,8 +105,8 @@ export function useRequests(tab = 'pending') {
         await rejectRequest(id, note)
       }
     } catch (e) {
-      // Restore row if API call failed
       setAnimatingOut(prev => { const s = new Set(prev); s.delete(id); return s })
+      setError(e.message || 'Action failed. Please try again.')  // ← NEW: surface it
       throw e
     }
 

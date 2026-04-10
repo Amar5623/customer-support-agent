@@ -154,6 +154,7 @@ class GetOrderHistoryPG(BaseTool):
                     "email":        email,
                     "total_orders": len(orders),
                     "orders":       orders,
+                    "instructions":"Always use the exact order_id values as returned above when calling other tools. Never shorten or modify them.",
                 })
 
         except Exception as e:
@@ -509,6 +510,7 @@ class ChangeDeliveryDatePG(BaseTool):
         email          = kwargs.get("email", "").strip().lower()
         order_id       = kwargs.get("order_id", "").strip()
         requested_date = kwargs.get("requested_date", "").strip()
+        session_id     = kwargs.get("session_id", "") 
 
         if not email:
             return self.error("email is required.")
@@ -518,13 +520,14 @@ class ChangeDeliveryDatePG(BaseTool):
             return self.error("requested_date is required.")
 
         try:
-            req_dt = datetime.strptime(requested_date, "%Y-%m-%d")
+            from datetime import date as date_type
+            req_dt = date_type.fromisoformat(requested_date)
         except ValueError:
             return self.error(
                 f"Invalid date format '{requested_date}'. Please use YYYY-MM-DD."
             )
 
-        if req_dt.date() <= datetime.utcnow().date():
+        if req_dt <= datetime.utcnow().date():
             return self.error("Requested date must be in the future.")
 
         try:
@@ -607,16 +610,17 @@ class ChangeDeliveryDatePG(BaseTool):
                              requested_date, "current_date", session_id, created_at)
                         VALUES
                             (:id, :type, :status, :order_id, :user_id,
-                             :requested_date, :current_date, NULL, :created_at)
+                             :requested_date, :current_date,:session_id, :created_at)
                     """),
                     {
                         "id":             request_id,
                         "type":           "date_change",
-                        "status":         "pending",
+                        "status":         "pending",    
                         "order_id":       order_id,
                         "user_id":        user_id,
                         "requested_date": req_dt,
                         "current_date":   order["order_estimated_delivery_date"],
+                        "session_id": session_id, 
                         "created_at":     now,
                     }
                 )

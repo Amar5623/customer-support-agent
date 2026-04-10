@@ -206,6 +206,8 @@ async def _pg_approve_request(
         requested_date = req["requested_date"]
         if isinstance(requested_date, datetime):
             requested_date = requested_date.date()
+        elif isinstance(requested_date, str):
+            requested_date = date.fromisoformat(requested_date.split("T")[0])  # ← add this line
 
         await session.execute(
             text("""
@@ -217,9 +219,9 @@ async def _pg_approve_request(
         )
 
         approval_message = (
-            f"Great news! Your delivery date change request has been approved. "
-            f"Your new delivery date is {_format_date(req['requested_date'])}."
-        )
+                f"Great news! Your delivery date change request has been approved. "
+                f"Your new delivery date is {_format_date(requested_date)}."  # ← use stripped variable
+                )
 
     elif req["type"] == "address_change":
         new_address = (
@@ -307,21 +309,35 @@ async def _pg_approve_request(
     await session.commit()
 
     session_id = req["session_id"] or ""
-    if session_id:
-        await conversations.append_notification(
-            session_id = session_id,
-            message    = approval_message,
-            status     = "approved",
+    if not session_id:
+        logger.warning(
+            f"[NOTIFY] No session_id for request={request_id} type={req['type']} "
+            f"— cannot deliver approval notification"
         )
-
-    await ws_manager.notify_session(
-        session_id = session_id,
-        payload    = {
-            "type":    "request_resolved",
-            "status":  "approved",
-            "message": approval_message,
-        }
-    )
+    else:
+        try:
+            await conversations.append_notification(
+                session_id = session_id,
+                message    = approval_message,
+                status     = "approved",
+            )
+            delivered = await ws_manager.notify_session(
+                session_id = session_id,
+                payload    = {
+                    "type":    "request_resolved",
+                    "status":  "approved",
+                    "message": approval_message,
+                }
+            )
+            logger.info(
+                f"[NOTIFY] Approval notification — request={request_id} "
+                f"session={session_id} ws_delivered={delivered}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[NOTIFY] Failed to send approval notification "
+                f"request={request_id} session={session_id}: {e}"
+            )
 
     return {"status": "approved", "request_id": request_id, "note": note}
 
@@ -389,21 +405,35 @@ async def _pg_reject_request(
     )
 
     session_id = req["session_id"] or ""
-    if session_id:
-        await conversations.append_notification(
-            session_id = session_id,
-            message    = rejection_message,
-            status     = "rejected",
+    if not session_id:
+        logger.warning(
+            f"[NOTIFY] No session_id for request={request_id} type={req['type']} "
+            f"— cannot deliver rejection notification"
         )
-
-    await ws_manager.notify_session(
-        session_id = session_id,
-        payload    = {
-            "type":    "request_resolved",
-            "status":  "rejected",
-            "message": rejection_message,
-        }
-    )
+    else:
+        try:
+            await conversations.append_notification(
+                session_id = session_id,
+                message    = rejection_message,
+                status     = "rejected",
+            )
+            delivered = await ws_manager.notify_session(
+                session_id = session_id,
+                payload    = {
+                    "type":    "request_resolved",
+                    "status":  "rejected",
+                    "message": rejection_message,
+                }
+            )
+            logger.info(
+                f"[NOTIFY] Rejection notification — request={request_id} "
+                f"session={session_id} ws_delivered={delivered}"
+            )
+        except Exception as e:
+            logger.error(
+                f"[NOTIFY] Failed to send rejection notification "
+                f"request={request_id} session={session_id}: {e}"
+            )
 
     return {"status": "rejected", "request_id": request_id, "note": note}
 

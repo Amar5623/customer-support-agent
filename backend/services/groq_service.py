@@ -58,9 +58,11 @@ class GroqService(LLMBase):
         messages:      list[Message],
         tools:         list[BaseTool],
         system_prompt: str,
+        session_id: str  = None 
     ) -> AgentResponse:
 
         groq_messages = self._build_messages(messages, system_prompt)
+        self._session_id = session_id  
 
         all_tool_calls:   list[ToolCall]   = []
         all_tool_results: list[ToolResult] = []
@@ -317,6 +319,8 @@ class GroqService(LLMBase):
                 logger.warning(f"Groq called unknown tool: {tool_name}")
             else:
                 logger.info(f"Executing tool: {tool_name} with args: {list(arguments.keys())}")
+                if tool_name == "tool_invoke" and self._session_id:
+                    arguments["session_id"] = self._session_id
                 result = await tool.execute(**arguments)
 
             result_content = json.dumps(result)

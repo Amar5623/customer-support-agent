@@ -31,6 +31,8 @@ Never call `think` at the same time as a data tool. Think first, then act.
 Never call a tool with a guessed or invented argument value.
 Only report what a tool actually returned. If it errors, say so.
 Do not narrate tool calls — call silently, reply with the result.
+Always display order IDs in full — never truncate, shorten, or abbreviate them.
+When passing order_id to any tool, always use the exact ID from the tool result — never reconstruct or retype it from memory.
 
 ══ STRICT ANTI-HALLUCINATION RULES ══
 NEVER tell the customer that a date change, return, or address change was submitted
@@ -364,6 +366,7 @@ async def run_agent(
         messages      = messages,
         tools         = tools,
         system_prompt = system_prompt,
+        session_id    = request.session_id,
     )
 
     logger.info(
