@@ -87,6 +87,10 @@ def _slim_tool_result(tool_name: str, content_str: str) -> str:
         elif real_tool_name == "get_user_profile" and isinstance(data, dict):
             keep = {"name", "surname", "email", "loyaltyTier", "loyaltyPoints", "accountStatus"}
             result["data"] = {k: v for k, v in data.items() if k in keep}
+        elif real_tool_name == "reorder_last_order" and isinstance(data, dict):
+            keep = {"outcome", "items", "total_items", "order_total",
+                    "ship_to", "estimated_delivery", "message"}
+            result["data"] = {k: v for k, v in data.items() if k in keep}
  
         # tool_search and tool_invoke results are small — no slimming needed.
         # think results are tiny — no slimming needed.

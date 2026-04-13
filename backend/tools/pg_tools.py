@@ -9,7 +9,7 @@ import uuid
 from backend.tools.base import BaseTool
 import re
 import json
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -2496,6 +2496,183 @@ class EscalateToHumanPG(BaseTool):
         except Exception as e:
             logger.exception(f"escalate_to_human failed for {email}")
             return self.error(f"Failed to create escalation: {str(e)}")
+class ReorderLastOrderPG(BaseTool):
+    """Recreates customer's last delivered order with current prices and stock validation."""
+ 
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+ 
+    @property
+    def name(self) -> str:
+        return "reorder_last_order"
+ 
+    @property
+    def description(self) -> str:
+        return (
+            "Recreate customer's most recent delivered/completed order as new Processing order. "
+            "Triggers: repeat order, reorder, buy again, same items again. "
+            "Validates stock, uses current prices, decrements inventory."
+        )
+ 
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {"email": {"type": "string", "description": "Customer email"}},
+            "required": ["email"]
+        }
+ 
+    async def execute(self, **kwargs: Any) -> dict:
+        email = kwargs.get("email", "").strip().lower()
+        if not email:
+            return self.error("email required")
+ 
+        try:
+            async with self._session_factory() as session:
+ 
+                # Verify customer and get address
+                result = await session.execute(
+                    text("""
+                        SELECT c.customer_id, c.full_address
+                        FROM customers c
+                        JOIN users u ON LOWER(c.email) = LOWER(u.email)
+                        WHERE LOWER(c.email) = :email
+                        LIMIT 1
+                    """),
+                    {"email": email}
+                )
+                customer = result.mappings().first()
+                if not customer:
+                    return self.error(f"No account found: {email}")
+ 
+                customer_id = customer["customer_id"]
+ 
+                # Get last completed order
+                order_result = await session.execute(
+                    text("""
+                        SELECT order_id
+                        FROM orders
+                        WHERE customer_id = :cid
+                          AND LOWER(order_status) IN ('delivered', 'completed')
+                        ORDER BY order_purchase_timestamp DESC
+                        LIMIT 1
+                    """),
+                    {"cid": customer_id}
+                )
+                src = order_result.mappings().first()
+                if not src:
+                    return self.success({
+                        "outcome": "no_orders",
+                        "message": "No completed orders to reorder."
+                    })
+ 
+                src_id = src["order_id"]
+ 
+                # Get items + validate products + check stock
+                items_result = await session.execute(
+                    text("""
+                        SELECT oi.product_id, oi.seller_id, oi.freight_value,
+                               p.product_name, p.product_price, p.stock_quantity
+                        FROM order_items oi
+                        JOIN products p ON oi.product_id = p.product_id
+                        WHERE oi.order_id = :oid
+                          AND p.stock_quantity > 0
+                    """),
+                    {"oid": src_id}
+                )
+                items = items_result.mappings().all()
+ 
+                if not items:
+                    return self.success({
+                        "outcome": "unavailable",
+                        "message": "Items from your previous order are out of stock."
+                    })
+ 
+                # Calculate totals
+                subtotal = sum(float(i["product_price"]) for i in items)
+                shipping = sum(float(i["freight_value"] or 0) for i in items)
+                total = subtotal + shipping
+ 
+                # Create order
+                new_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc)
+                eta = now + timedelta(days=7)
+ 
+                await session.execute(
+                    text("""
+                        INSERT INTO orders (
+                            order_id, customer_id, order_status,
+                            delivery_full_address,
+                            order_purchase_timestamp, order_estimated_delivery_date, reorder_source_id
+                        ) VALUES (
+                            :oid, :cid, 'Processing',
+                            :addr,
+                            :ts, :eta, :src
+                        )
+                    """),
+                    {
+                        "oid": new_id, "cid": customer_id,
+                        "addr": customer["full_address"],
+                        "ts": now, "eta": eta, "src": src_id
+                    }
+                )
+ 
+                # Insert items + decrement stock
+                for item in items:
+                    await session.execute(
+                        text("""
+                            INSERT INTO order_items (order_item_id, order_id, product_id, seller_id, price, freight_value)
+                            VALUES (:iid, :oid, :pid, :sid, :price, :freight)
+                        """),
+                        {
+                            "iid": str(uuid.uuid4()), "oid": new_id,
+                            "pid": item["product_id"], "sid": item["seller_id"],
+                            "price": item["product_price"], "freight": item["freight_value"]
+                        }
+                    )
+                    
+                    # Decrement stock
+                    await session.execute(
+                        text("UPDATE products SET stock_quantity = stock_quantity - 1 WHERE product_id = :pid"),
+                        {"pid": item["product_id"]}
+                    )
+ 
+                # Get payment type from original order
+                payment_result = await session.execute(
+                    text("SELECT payment_type FROM order_payments WHERE order_id = :oid LIMIT 1"),
+                    {"oid": src_id}
+                )
+                payment = payment_result.mappings().first()
+                payment_type = payment["payment_type"] if payment else "credit_card"
+ 
+                # Insert payment
+                await session.execute(
+                    text("INSERT INTO order_payments (order_id, payment_type, payment_value) VALUES (:oid, :type, :val)"),
+                    {"oid": new_id, "type": payment_type, "val": total}
+                )
+ 
+                await session.commit()
+ 
+                logger.info(f"[REORDER] {new_id} from {src_id} for customer {customer_id}")
+ 
+                return self.success({
+                    "outcome": "reordered",
+                    "new_order_id": new_id,
+                    "items": [i["product_name"] for i in items],
+                    "total_items": len(items),
+                    "total": round(total, 2),
+                    "eta": eta.strftime("%B %d, %Y"),
+                    "message": f"Reorder placed successfully. Order ID: {new_id}. ETA: {eta.strftime('%B %d, %Y')}."
+                })
+ 
+        except Exception as e:
+            logger.exception(f"ReorderLastOrderPG failed: {email}")
+            return self.error(f"Reorder failed: {str(e)}")
+ 
+        except Exception as e:
+            logger.exception(f"ReorderLastOrderPG.execute failed for {email}")
+            return self.error(f"Unexpected error while placing reorder: {str(e)}") 
+
 
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
@@ -2516,4 +2693,5 @@ def get_all_pg_tools(session_factory) -> list[BaseTool]:
         GetRequestStatusPG(session_factory),
         CancelOrderPG(session_factory),
         EscalateToHumanPG(session_factory),
+        ReorderLastOrderPG(session_factory),
     ]
