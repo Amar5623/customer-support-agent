@@ -1601,7 +1601,7 @@ class InitiateReturnPG(BaseTool):
                             :id, :type, :status, :order_id, :user_id,
                             :reason, :items, :refund_method,
                             :shipping_covered_by,
-                            NULL, :created_at
+                            :session_id, :created_at
                         )
                     """),
                     {

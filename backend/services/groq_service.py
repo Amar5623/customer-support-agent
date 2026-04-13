@@ -83,14 +83,41 @@ class GroqService(LLMBase):
 
                 is_last_iteration = (iteration == max_iterations)
 
-                response = await self._client.chat.completions.create(
-                    model       = self._model,
-                    messages    = groq_messages,
-                    tools       = self._schemas,
-                    tool_choice = "none" if is_last_iteration else "auto",
-                    temperature = settings.groq_temperature,
-                    max_tokens  = settings.groq_max_tokens,
-                )
+                try:
+                    response = await self._client.chat.completions.create(
+                        model       = self._model,
+                        messages    = groq_messages,
+                        tools       = self._schemas,
+                        tool_choice = "none" if is_last_iteration else "auto",
+                        temperature = settings.groq_temperature,
+                        max_tokens  = settings.groq_max_tokens,
+                    )
+                except Exception as api_err:
+                    logger.warning(f"[GROQ] Bad request on iteration {iteration} — retrying with tool_choice=none")
+                    while groq_messages and groq_messages[-1].get("role") == "assistant" and not groq_messages[-1].get("content"):
+                        groq_messages.pop()
+                    # Inject nudge to force plain text response
+                    groq_messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Reply to the customer in plain text only. "
+                            "Do NOT output any JSON or tool calls. "
+                            "Use tool_invoke with tool_id to call any tool."
+                        )
+                    })
+                    fallback = await self._client.chat.completions.create(
+                        model       = self._model,
+                        messages    = groq_messages,
+                        tools       = self._schemas,
+                        tool_choice = "none",
+                        temperature = settings.groq_temperature,
+                        max_tokens  = settings.groq_max_tokens,
+                    )
+                    return AgentResponse(
+                        message      = fallback.choices[0].message.content or "I'm sorry, I wasn't able to process that. Please try again.",
+                        tool_calls   = all_tool_calls,
+                        tool_results = all_tool_results,
+                    )
 
                 # ── Log token usage for this API call ─────────────────────────
                 usage = response.usage
