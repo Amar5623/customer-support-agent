@@ -289,7 +289,6 @@ def _extract_tool_snippet(tool_name: str, data: dict) -> str:
                f"total: {data.get('total', '')} | "
                f"eta: {data.get('eta', '')}"
            )
-
     except Exception:
         pass
     return ""
