@@ -510,7 +510,7 @@ class ChangeDeliveryDatePG(BaseTool):
         email          = kwargs.get("email", "").strip().lower()
         order_id       = kwargs.get("order_id", "").strip()
         requested_date = kwargs.get("requested_date", "").strip()
-        session_id     = kwargs.get("session_id", "") 
+        session_id     = kwargs.get("session_id", "")
 
         if not email:
             return self.error("email is required.")
@@ -520,7 +520,7 @@ class ChangeDeliveryDatePG(BaseTool):
             return self.error("requested_date is required.")
 
         try:
-            from datetime import date as date_type
+            from datetime import date as date_type, timedelta
             req_dt = date_type.fromisoformat(requested_date)
         except ValueError:
             return self.error(
@@ -553,7 +553,8 @@ class ChangeDeliveryDatePG(BaseTool):
 
                 order_result = await session.execute(
                     text("""
-                        SELECT order_id, order_status, order_estimated_delivery_date
+                        SELECT order_id, order_status, order_estimated_delivery_date,
+                               order_purchase_timestamp
                         FROM orders
                         WHERE order_id    = :order_id
                           AND customer_id = :customer_id
@@ -572,6 +573,26 @@ class ChangeDeliveryDatePG(BaseTool):
                             "Your order has already been shipped and the delivery date "
                             "cannot be changed at this stage."
                         ),
+                        "email":    email,
+                        "order_id": order_id,
+                    })
+
+                # Earliest allowed delivery = order_purchase_timestamp + 3 days
+                purchase_date = order["order_purchase_timestamp"]
+                if hasattr(purchase_date, "date"):
+                    purchase_date = purchase_date.date()
+                earliest_allowed = purchase_date + timedelta(days=3)
+
+                if req_dt < earliest_allowed:
+                    return self.success({
+                        "outcome": "rejected",
+                        "reason": (
+                            f"The earliest possible delivery date for your order is "
+                            f"{earliest_allowed.strftime('%d %B %Y')} "
+                            f"(3 days after your order was placed). "
+                            f"Please choose a date on or after this."
+                        ),
+                        "earliest_allowed_date": str(earliest_allowed),
                         "email":    email,
                         "order_id": order_id,
                     })
@@ -610,17 +631,17 @@ class ChangeDeliveryDatePG(BaseTool):
                              requested_date, "current_date", session_id, created_at)
                         VALUES
                             (:id, :type, :status, :order_id, :user_id,
-                             :requested_date, :current_date,:session_id, :created_at)
+                             :requested_date, :current_date, :session_id, :created_at)
                     """),
                     {
                         "id":             request_id,
                         "type":           "date_change",
-                        "status":         "pending",    
+                        "status":         "pending",
                         "order_id":       order_id,
                         "user_id":        user_id,
                         "requested_date": req_dt,
                         "current_date":   order["order_estimated_delivery_date"],
-                        "session_id": session_id, 
+                        "session_id":     session_id,
                         "created_at":     now,
                     }
                 )
@@ -651,7 +672,6 @@ class ChangeDeliveryDatePG(BaseTool):
         except Exception as e:
             logger.exception(f"change_delivery_date failed for {order_id}")
             return self.error(f"Failed to process date change request: {str(e)}")
-
 
 # ── 5. Change Delivery Address ───────────────────────────────────────────────
 
