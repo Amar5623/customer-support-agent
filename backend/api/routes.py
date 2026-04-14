@@ -216,7 +216,7 @@ async def get_conversations_history(
     """Returns last 5 conversations for the logged-in user."""
     history = await conversations.get_history(
         user_id = str(current_user["_id"]),
-        limit   = 5,
+        limit   = 10,
     )
     return {"conversations": history}
 

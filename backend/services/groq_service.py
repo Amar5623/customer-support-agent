@@ -138,7 +138,7 @@ class GroqService(LLMBase):
                     )
 
                 choice  = response.choices[0]
-                message = choice.message
+                message = choice.message 
 
                 # ── No tool calls → model is done ─────────────────────────
                 if not message.tool_calls:

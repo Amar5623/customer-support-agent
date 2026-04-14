@@ -74,10 +74,14 @@ do NOT re-fetch. The data is in your history — use it.
 
 When a customer wants to change the delivery date:
   - Must have a confirmed order_id before calling the date-change tool.
-  - If customer says "sooner" / no specific date: call think ALONE first.
-    Then fetch order details if NOT already fetched, read estimated_warehouse_date,
-    compute earliest = warehouse_date + 1 day, tell the customer and wait for confirmation.
+  - If customer says "sooner" / no specific date: ask the customer what date they prefer.
+  - If the tool returns outcome "rejected" with an earliest_allowed_date:
+    → Tell the customer that date is too early.
+    → Tell them the earliest possible date from the tool response.
+    → Ask them to choose a new date. Do NOT auto-confirm the earliest date.
+    → Wait for the customer to explicitly confirm a new date before calling the tool again.
   - Never ask the customer to supply a date they cannot know.
+  - Never auto-submit with the earliest_allowed_date without customer confirmation..
 When a customer reports an empty package or missing items from a delivered order:
   Step 1 → Call think ALONE to identify the order.
   Step 2 → Call report_missing_item directly with the confirmed order_id,
@@ -104,6 +108,13 @@ When a customer wants to cancel an order:
       → Explain: can't cancel in current state.
       → Advise: contact support.
   Never call cancel_order without confirmed order_id or with guessed reason.
+When a customer wants to reorder a previous order:
+  Step 1 → Call think ALONE to identify which order they want to reorder.
+  Step 2 → If customer specifies a particular order → use that order_id.
+            If customer says "my last order" or doesn't specify → omit order_id (tool uses latest delivered).
+  Step 3 → Call reorder_last_order with email and optional order_id.
+  Step 4 → Report back: new order ID, items, total, payment method (Cash on Delivery), and ETA.
+  Never call reorder without confirming the customer wants to proceed.
 
 ══ CANNOT DO ══
 Cannot: upgrade shipping speed, expedite, waive fees, modify order contents,
@@ -270,6 +281,14 @@ def _extract_tool_snippet(tool_name: str, data: dict) -> str:
             return f"Cancel order outcome: {outcome} for order {str(data.get('order_id', ''))[-8:]}"
         elif tool_name == "initiate_return":
             return f"Return outcome: {data.get('outcome', '')} request_id={data.get('request_id', '')[:8]}"
+        elif tool_name == "reorder_last_order":
+           return (
+               f"Reorder outcome: {data.get('outcome', '')} | "
+               f"new_order_id: {data.get('new_order_id', '')} | "
+               f"items: {', '.join(data.get('items', [])[:2])} | "
+               f"total: {data.get('total', '')} | "
+               f"eta: {data.get('eta', '')}"
+           )
 
     except Exception:
         pass

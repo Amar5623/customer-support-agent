@@ -206,13 +206,13 @@ async def _pg_approve_request(
     # ── Branch on request type ────────────────────────────────────────────────
 
     if req["type"] == "date_change":
-        # Strip to plain date — the column is DATE, not TIMESTAMPTZ
         requested_date = req["requested_date"]
         if isinstance(requested_date, datetime):
-            requested_date = requested_date.date()
+          from datetime import timedelta as _timedelta, timezone as _timezone
+          IST = _timezone(_timedelta(hours=5, minutes=30))
+          requested_date = requested_date.astimezone(IST).date()
         elif isinstance(requested_date, str):
-            requested_date = date.fromisoformat(requested_date.split("T")[0])  # ← add this line
-
+            requested_date = date.fromisoformat(requested_date.split("T")[0])
         await session.execute(
             text("""
                 UPDATE orders
