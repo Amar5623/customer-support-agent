@@ -42,3 +42,4 @@ tests/
 sample.py
 
 .openclaude-profile.json
+myvenv/

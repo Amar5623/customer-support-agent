@@ -1,4 +1,4 @@
-  // frontend/src/components/ConversationSidebar.jsx
+// frontend/src/components/ConversationSidebar.jsx
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
