@@ -18,20 +18,6 @@ function timeAgo(isoString) {
   }
 }
 
-function getPreview(conv) {
-    const msgs = conv.messages || [];
-    // Walk backwards to find the last REAL assistant reply.
-    // Skip tool-call encoding rows (start with __tool_calls__:) and empty content.
-    const last = [...msgs].reverse().find(
-      (m) =>
-        m.role === "assistant" &&
-        m.content &&
-        !m.content.startsWith("__tool_calls__:") &&
-        m.content.trim().length > 0
-    );
-    return last?.content?.slice(0, 60) || "No messages yet";
-  }
-
 /**
  * Extract a meaningful title from the conversation.
  * Uses the first user message that isn't a system header.

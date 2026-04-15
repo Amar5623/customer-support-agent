@@ -222,7 +222,7 @@ class ConversationStore:
                     "role":         "tool",
                     "content":      tr.content,
                     "tool_call_id": tr.tool_call_id,
-                    "name":         tool_nm,
+                    "name":         tc_id_to_name.get(tr.tool_call_id, "unknown"),
                     "timestamp":    _now(),
                 })
 
