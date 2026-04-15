@@ -37,14 +37,26 @@ function buildMessages(rawMsgs = []) {
         !m.content.startsWith("__tool_calls__:")
     )
     .map((m) => ({
-      id: makeId(),
-      role: m.role,
-      content: m.content,
-      timestamp: m.timestamp || new Date().toISOString(),
+      id:             makeId(),
+      role:           m.role,
+      content:        m.content,
+      timestamp:      normaliseTimestamp(m.timestamp),
       isNotification: m.role === "notification",
-      status: m.status || null,
-      isError: false,
+      status:         m.status || null,
+      isError:        false,
     }));
+}
+
+/**
+ * Ensure an ISO timestamp string is always parsed as UTC by JS.
+ * If the string already has +HH:MM or Z — leave it alone.
+ * If it's a bare "YYYY-MM-DDTHH:mm:ss[.ffffff]" — append Z.
+ */
+function normaliseTimestamp(ts) {
+  if (!ts) return new Date().toISOString();
+  if (typeof ts !== "string") return new Date(ts).toISOString();
+  if (ts.endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(ts)) return ts;
+  return ts + "Z";
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────────
@@ -56,29 +68,56 @@ export function useChat(user) {
   const [conversations, setConversations] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
 
-  const sessionIdRef = useRef(null);
+  /**
+   * sessionIdRef is the authoritative "which session owns the in-flight request"
+   * guard. We use a ref (not state) because closures in async callbacks need to
+   * see the latest value synchronously — state updates are batched and async.
+   *
+   * NOTE: We do NOT sync this via a useEffect. A useEffect sync introduces a
+   * one-render lag: if the user sends a message in the same render cycle that
+   * triggered the session change, the ref would still hold the old value. We
+   * assign sessionIdRef.current directly at every call site instead.
+   */
+  const sessionIdRef       = useRef(null);
+  const wsRef              = useRef(null);
+  const reconnectTimerRef  = useRef(null); // tracks pending WS reconnect timers
   const abortControllerRef = useRef(null);
-  const wsRef = useRef(null);
-
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
 
   // ── WebSocket ─────────────────────────────────────────────────────────────
 
+  /**
+   * connectWebSocket(sid)
+   *
+   * Opens a fresh WS connection for the given session, closing any previous one.
+   * Auto-reconnects after 3 s on unexpected close so the user never misses
+   * an admin approval/rejection notification mid-session.
+   *
+   * Guard: if the user switches session while a reconnect is pending, we cancel
+   * the timer before opening the new connection, so we never resurrect a stale
+   * socket for the old session.
+   */
   const connectWebSocket = useCallback((sid) => {
-    // Close existing socket
+    // Cancel any pending reconnect timer for the previous session
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    // Null out onclose first so the old socket's reconnect path doesn't fire
     if (wsRef.current) {
+      wsRef.current.onclose = null;
       wsRef.current.close();
       wsRef.current = null;
     }
 
+    // Guard: nothing to connect to
     if (!sid) return;
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const host = window.location.host;
 
     const ws = new WebSocket(`${protocol}//${host}/ws/${sid}`);
+    // Assign immediately so the wsRef.current !== ws guard in onclose works
     wsRef.current = ws;
 
     ws.onopen = async () => {
@@ -113,6 +152,9 @@ export function useChat(user) {
         const data = JSON.parse(event.data);
 
         if (data.type !== "request_resolved") return;
+
+        // Guard: only inject notification into the session that owns this WS.
+        // If the user has already switched to a different chat, sid is stale.
         if (sessionIdRef.current !== sid) return;
 
         setMessages((prev) => [
@@ -125,20 +167,29 @@ export function useChat(user) {
     };
 
     ws.onerror = (err) => {
+      // Log for debugging; let onclose handle reconnect (onerror fires before
+      // onclose on most browsers, so we avoid double-reconnect by not acting here)
       console.error("WebSocket error:", err);
       ws.close();
     };
 
     ws.onclose = () => {
+      // Only reconnect if this socket is still the active one for this session.
+      // If wsRef.current was already replaced (intentional switch), bail out.
       if (wsRef.current !== ws) return;
 
-      setTimeout(() => {
+      // Only reconnect if we're still in the same session.
+      if (sessionIdRef.current !== sid) return;
+
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        // Re-check session hasn't changed during the delay
         if (sessionIdRef.current === sid) {
           connectWebSocket(sid);
         }
       }, 3000);
     };
-  }, []);
+  }, []); // stable — no external deps; reconnect closes over sid
 
   // ── Init on login ──────────────────────────────────────────────────────────
 
@@ -162,7 +213,6 @@ export function useChat(user) {
       try {
         const sid = await getNewSession();
         if (cancelled) return;
-
         sessionIdRef.current = sid;
         setSessionId(sid);
         connectWebSocket(sid);
@@ -177,75 +227,78 @@ export function useChat(user) {
     };
   }, [user, connectWebSocket]);
 
-  // ── Send message ───────────────────────────────────────────────────────────
+  // ── Send a message ─────────────────────────────────────────────────────────
 
-  const send = useCallback(async (text) => {
-    const sendingSessionId = sessionIdRef.current;
+  const send = useCallback(
+    async (text) => {
+      const sendingSessionId = sessionIdRef.current;
+      if (!sendingSessionId || !text.trim()) return;
 
-    if (!sendingSessionId || !text.trim()) return;
-
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    const userMsg = {
-      id: makeId(),
-      role: "user",
-      content: text.trim(),
-      timestamp: new Date().toISOString(),
-      isError: false,
-    };
-
-    setMessages((prev) => [...prev, userMsg]);
-    setLoading(true);
-
-    try {
-      const data = await apiSendMessage({
-        message: text.trim(),
-        sessionId: sendingSessionId,
-        signal: controller.signal,
-      });
-
-      if (sessionIdRef.current !== sendingSessionId) return;
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: makeId(),
-          role: "assistant",
-          content: data.reply,
-          timestamp: data.timestamp || new Date().toISOString(),
-          isError: false,
-        },
-      ]);
-
-      getConversationHistory()
-        .then((d) => setConversations(d.conversations || []))
-        .catch(() => {});
-    } catch (err) {
-      if (err.name === "AbortError") return;
-
-      if (sessionIdRef.current !== sendingSessionId) return;
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: makeId(),
-          role: "assistant",
-          content: "Something went wrong. Please try again.",
-          timestamp: new Date().toISOString(),
-          isError: true,
-        },
-      ]);
-    } finally {
-      if (sessionIdRef.current === sendingSessionId) {
-        setLoading(false);
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
       }
-    }
-  }, []);
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
+      const userMsg = {
+        id:        makeId(),
+        role:      "user",
+        content:   text.trim(),
+        timestamp: new Date().toISOString(),
+        isError:   false,
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      setLoading(true);
+
+      try {
+        const data = await apiSendMessage({
+          message:   text.trim(),
+          sessionId: sendingSessionId,
+          signal:    controller.signal,
+        });
+
+        if (sessionIdRef.current !== sendingSessionId) return;
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id:        makeId(),
+            role:      "assistant",
+            content:   data.reply,
+            // normaliseTimestamp ensures the backend's tz-naive strings are
+            // always treated as UTC, consistent with buildMessages()
+            timestamp: normaliseTimestamp(data.timestamp) || new Date().toISOString(),
+            isError:   false,
+          },
+        ]);
+
+        // Refresh sidebar history in the background
+        getConversationHistory()
+          .then((d) => setConversations(d.conversations || []))
+          .catch(() => {});
+
+      } catch (err) {
+        if (err.name === "AbortError") return;
+        if (sessionIdRef.current !== sendingSessionId) return;
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id:        makeId(),
+            role:      "assistant",
+            content:   "Something went wrong. Please try again.",
+            timestamp: new Date().toISOString(),
+            isError:   true,
+          },
+        ]);
+      } finally {
+        if (sessionIdRef.current === sendingSessionId) {
+          setLoading(false);
+        }
+      }
+    },
+    []
+  );
 
   // ── New chat ───────────────────────────────────────────────────────────────
 
@@ -263,11 +316,11 @@ export function useChat(user) {
       sessionIdRef.current = sid;
       setSessionId(sid);
       connectWebSocket(sid);
-    } catch {
-      const sid = crypto.randomUUID();
-      sessionIdRef.current = sid;
-      setSessionId(sid);
-      connectWebSocket(sid);
+    } catch (_) {
+      // Session creation failed — leave sessionId/ref as-is so the user sees
+      // an empty chat rather than a fake local session that would silently drop
+      // every message on the backend. The UI can surface the error separately.
+      console.error("Failed to create new session");
     }
   }, [connectWebSocket]);
 
@@ -293,8 +346,12 @@ export function useChat(user) {
 
   useEffect(() => {
     return () => {
+      if (reconnectTimerRef.current)  clearTimeout(reconnectTimerRef.current);
       if (abortControllerRef.current) abortControllerRef.current.abort();
-      if (wsRef.current) wsRef.current.close();
+      if (wsRef.current) {
+        wsRef.current.onclose = null; // prevent reconnect loop on unmount
+        wsRef.current.close();
+      }
     };
   }, []);
 

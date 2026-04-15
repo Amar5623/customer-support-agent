@@ -29,21 +29,30 @@ class ResolutionBody(BaseModel):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _serialize_request(doc: dict) -> dict:
-    """Mongo-only helper: convert ObjectId/datetime fields to strings."""
-    from bson import ObjectId
+    """
+    Recursively convert a MongoDB document to a JSON-serializable dict.
+    Handles ObjectId, datetime, nested dicts, and lists containing any of these.
+    The old version missed lists — which is exactly where the new tools
+    store things like 'items: [ObjectId(...), ...]' or nested sub-documents.
+    """
     result = {}
     for k, v in doc.items():
-        if isinstance(v, ObjectId):
-            result[k] = str(v)
-        elif isinstance(v, datetime):
-            result[k] = v.isoformat()
-        elif isinstance(v, dict):
-            result[k] = _serialize_request(v)
-        else:
-            result[k] = v
+        result[k] = _serialize_value(v)
     return result
 
 
+def _serialize_value(v):
+    """Recursively serialize any value that may come out of MongoDB."""
+    if isinstance(v, ObjectId):
+        return str(v)
+    elif isinstance(v, datetime):
+        return v.isoformat()
+    elif isinstance(v, dict):
+        return _serialize_request(v)
+    elif isinstance(v, list):
+        return [_serialize_value(item) for item in v]
+    else:
+        return v
 def _format_date(value) -> str:
     """
     FIX: Safely format a date or datetime value from a DB row.

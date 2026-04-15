@@ -28,9 +28,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Config: {settings.redacted_summary()}")
     logger.info(f"DB mode: {settings.db_tool_mode}")
 
-    await connect_db()          # self-skips if db_tool_mode != mongo
-    await connect_pg()          # self-skips if db_tool_mode != postgres
-    init_container(get_db())    # builds container after DB is ready
+    await connect_db()
+    await connect_pg()
+    init_container(get_db())
 
     logger.info("Application ready.")
     yield
@@ -65,6 +65,20 @@ app.include_router(auth_router, prefix="/api")
 from backend.api.admin import router as admin_router
 app.include_router(admin_router, prefix="/api")
 
+
+# ── WebSocket endpoints ────────────────────────────────────────────────────────
+#
+# CRITICAL ORDER: /ws/admin MUST be declared before /ws/{session_id}.
+#
+# FastAPI/Starlette matches WebSocket routes in declaration order.
+# If /ws/{session_id} is first, "/ws/admin" is captured as a customer session
+# with session_id="admin" — the admin handler never fires, so:
+#   • ws_manager._admin_connections stays empty
+#   • broadcast_to_admins() notifies nobody
+#   • Admin CRM never gets live updates
+#   • Customer notifications also break (wrong handler registered the socket)
+#
+# Keeping /ws/admin first ensures the literal path wins before the wildcard.
 @app.websocket("/ws/admin")
 async def admin_websocket_endpoint(websocket: WebSocket):
     admin_id = str(uuid.uuid4())
@@ -83,9 +97,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(session_id)
-
-
-
 
 
 @app.get("/health")
