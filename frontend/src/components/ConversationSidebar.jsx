@@ -1,4 +1,4 @@
-// frontend/src/components/ConversationSidebar.jsx
+  // frontend/src/components/ConversationSidebar.jsx
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,20 @@ function timeAgo(isoString) {
     return "";
   }
 }
+
+function getPreview(conv) {
+    const msgs = conv.messages || [];
+    // Walk backwards to find the last REAL assistant reply.
+    // Skip tool-call encoding rows (start with __tool_calls__:) and empty content.
+    const last = [...msgs].reverse().find(
+      (m) =>
+        m.role === "assistant" &&
+        m.content &&
+        !m.content.startsWith("__tool_calls__:") &&
+        m.content.trim().length > 0
+    );
+    return last?.content?.slice(0, 60) || "No messages yet";
+  }
 
 /**
  * Extract a meaningful title from the conversation.
@@ -100,8 +114,8 @@ export function ConversationSidebar({
             <polyline points="16 17 21 12 16 7"/>
             <line x1="21" y1="12" x2="9" y2="12"/>
           </svg>
+          New chat
         </button>
-      </div>
 
       {/* ── New chat ── */}
       <button className="sidebar__new-chat" onClick={onNewChat}>

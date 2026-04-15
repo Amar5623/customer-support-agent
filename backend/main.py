@@ -65,7 +65,16 @@ app.include_router(auth_router, prefix="/api")
 from backend.api.admin import router as admin_router
 app.include_router(admin_router, prefix="/api")
 
-
+@app.websocket("/ws/admin")
+async def admin_websocket_endpoint(websocket: WebSocket):
+    admin_id = str(uuid.uuid4())
+    await ws_manager.connect_admin(admin_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect_admin(admin_id)
+        
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await ws_manager.connect(session_id, websocket)
@@ -76,15 +85,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         ws_manager.disconnect(session_id)
 
 
-@app.websocket("/ws/admin")
-async def admin_websocket_endpoint(websocket: WebSocket):
-    admin_id = str(uuid.uuid4())
-    await ws_manager.connect_admin(admin_id, websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        ws_manager.disconnect_admin(admin_id)
+
 
 
 @app.get("/health")
