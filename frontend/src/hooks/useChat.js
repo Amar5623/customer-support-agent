@@ -1,3 +1,4 @@
+// usechat.js
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   getNewSession,
@@ -67,18 +68,29 @@ export function useChat(user) {
   const [sessionId, setSessionId] = useState(null);
   const [conversations, setConversations] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
-
-  /**
-   * sessionIdRef is the authoritative "which session owns the in-flight request"
-   * guard. We use a ref (not state) because closures in async callbacks need to
-   * see the latest value synchronously — state updates are batched and async.
-   *
-   * NOTE: We do NOT sync this via a useEffect. A useEffect sync introduces a
-   * one-render lag: if the user sends a message in the same render cycle that
-   * triggered the session change, the ref would still hold the old value. We
-   * assign sessionIdRef.current directly at every call site instead.
-   */
-  const sessionIdRef       = useRef(null);
+  const prevUserIdRef = useRef(user?.id ?? user?.email ?? null);
+  useEffect(() => {
+    const currentId = user?.id ?? user?.email ?? null;
+    if (prevUserIdRef.current !== currentId) {
+      prevUserIdRef.current = currentId;
+      setMessages([]);
+      setLoading(false);
+      setSessionId(null);
+      setConversations([]);
+      setHistoryLoaded(false);
+      sessionIdRef.current = null;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    }
+  }, [user]);  
+  const sessionIdRef = useRef(null);   // ← this lin
   const wsRef              = useRef(null);
   const reconnectTimerRef  = useRef(null); // tracks pending WS reconnect timers
   const abortControllerRef = useRef(null);
@@ -121,32 +133,37 @@ export function useChat(user) {
     wsRef.current = ws;
 
     ws.onopen = async () => {
-      try {
-        const data = await getConversationHistory();
-        const currentConv = (data.conversations || []).find(
-          (c) => c.session_id === sid
-        );
+  try {
+    const data = await getConversationHistory();
 
-        if (!currentConv) return;
+    // Guard: session may have switched during the async fetch
+    if (sessionIdRef.current !== sid) return;
 
-        const dbNotifications = (currentConv.messages || [])
-          .filter((m) => m.role === "notification")
-          .map((m) => makeNotification(m.content, m.status || "approved"));
+    const currentConv = (data.conversations || []).find(
+      (c) => c.session_id === sid
+    );
+    if (!currentConv) return;
 
-        if (dbNotifications.length === 0) return;
+    const dbNotifications = (currentConv.messages || [])
+      .filter((m) => m.role === "notification")
+      .map((m) => makeNotification(m.content, m.status || "approved"));
 
-        setMessages((prev) => {
-          const seen = new Set(
-            prev.filter((m) => m.isNotification).map((m) => m.content)
-          );
-          const fresh = dbNotifications.filter((n) => !seen.has(n.content));
-          return fresh.length ? [...prev, ...fresh] : prev;
-        });
-      } catch (err) {
-        console.error("WS onopen sync error:", err);
-      }
-    };
+    if (dbNotifications.length === 0) return;
 
+    setMessages((prev) => {
+      // Skip entirely if messages were already loaded from DB
+      // (loadConversation already called buildMessages which includes notifications)
+      if (prev.some((m) => m.isNotification)) return prev;
+
+      // For fresh sessions only — add any DB notifications not yet shown
+      const seen = new Set(prev.filter((m) => m.isNotification).map((m) => m.content));
+      const fresh = dbNotifications.filter((n) => !seen.has(n.content));
+      return fresh.length ? [...prev, ...fresh] : prev;
+    });
+  } catch (err) {
+    console.error("WS onopen sync error:", err);
+  }
+};
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);

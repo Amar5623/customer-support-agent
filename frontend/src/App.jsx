@@ -50,7 +50,7 @@ export default function App() {
   }
 
   return (
-    <div className="shell">
+    <div key={user?.id ?? user?.email} className="shell">
       <ConversationSidebar
         user={user}
         conversations={conversations}

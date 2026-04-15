@@ -40,3 +40,5 @@ tests/fixtures/real_*.json
 tests/
 
 sample.py
+
+myvenv/
